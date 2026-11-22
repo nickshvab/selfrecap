@@ -2,7 +2,7 @@
 
 > HTTP API for Claude Code session continuity. Find clean cut points in JSONL session files, monitor context-window size, and perform self-authored "recap surgery" — an alternative to lossy auto-compaction for long-lived AI coding sessions.
 
-**Status:** v1.1.0 — the HTTP API (`find-cut-point`, `context`, `contexts`, `surgery`, the recap plan), the `/remember` Claude Code skill, a CLI that drives the whole cycle, multi-recap layering, verified backups, surgery that is safe to run from inside the live session, and security hardening. Optional and Windows-only: a context nudger and `selfrecap restart`. See [CHANGELOG.md](./CHANGELOG.md).
+**Status:** v1.1.1 — the HTTP API (`find-cut-point`, `context`, `contexts`, `surgery`, the recap plan), the `/remember` Claude Code skill, a CLI that drives the whole cycle, multi-recap layering, verified backups, surgery that is safe to run from inside the live session, and security hardening. Optional and Windows-only: a context nudger and `selfrecap restart`. See [CHANGELOG.md](./CHANGELOG.md).
 
 ---
 
@@ -149,7 +149,7 @@ curl http://127.0.0.1:9090/health
 ```json
 {
   "status": "ok",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "voices_registered": 1,
   "voices_missing_file": 0,
   "config_problems": 0
