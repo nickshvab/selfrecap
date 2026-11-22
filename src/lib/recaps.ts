@@ -98,6 +98,11 @@ function lastSentinelKey(text: string, name: string): number | null {
  * Pretty-printed, compact and nested sentinels all parse.
  */
 export function parseSentinel(text: string, name = DEFAULT_SENTINEL): Sentinel | null {
+  return sentinelBlock(text, name)?.sentinel ?? null;
+}
+
+/** The last sentinel in `text` with where its object starts (`{`) and ends (`}`), or null. */
+function sentinelBlock(text: string, name: string): { open: number; close: number; key: number; sentinel: Sentinel } | null {
   const key = lastSentinelKey(text, name);
   if (key === null) return null;
   // Try enclosing objects nearest-first; a nested object before the key closes before it.
@@ -107,7 +112,7 @@ export function parseSentinel(text: string, name = DEFAULT_SENTINEL): Sentinel |
     if (close > key) {
       try {
         const obj = JSON.parse(text.slice(open, close + 1));
-        if (obj && typeof obj === "object" && obj.sentinel === name) return obj as Sentinel;
+        if (obj && typeof obj === "object" && obj.sentinel === name) return { open, close, key, sentinel: obj as Sentinel };
       } catch {
         // Not JSON from this brace — try the next one out.
       }
@@ -116,6 +121,57 @@ export function parseSentinel(text: string, name = DEFAULT_SENTINEL): Sentinel |
     open = text.lastIndexOf("{", open - 1);
   }
   return null;
+}
+
+/** What a body may carry in the sentinel before the cut is known; the pending cut fills it (see fillSentinelCut). */
+export const CUT_PLACEHOLDER = "CUT_UUID";
+
+export type SentinelCutFill =
+  /** The sentinel already names a cut; it is the pending one, or there is none to compare. */
+  | { action: "kept"; text: string; cut: string }
+  /** The placeholder (or no cut at all) was replaced with the pending cut. */
+  | { action: "filled"; text: string; cut: string; was: "placeholder" | "missing" }
+  /** The sentinel names another cut than the pending one. Nothing is changed. */
+  | { action: "mismatch"; body_cut: string; pending_cut: string }
+  /** The sentinel needs a cut and there is no pending cut to take it from. */
+  | { action: "no_pending"; was: "placeholder" | "missing" }
+  /** The field holds something that is neither a string nor null: fix it by hand. */
+  | { action: "unfillable" }
+  | { action: "no_sentinel" };
+
+/**
+ * Put the pending cut into the body's sentinel when it holds the placeholder
+ * (`"cut_through_uuid": "CUT_UUID"`), an empty value, or no cut_through_uuid
+ * at all. Only the last sentinel is touched, and only that one field: the
+ * rest of the body is returned byte for byte. `name` is the sentinel name
+ * (config.sentinel_name).
+ */
+export function fillSentinelCut(text: string, pendingCut: string | null, name = DEFAULT_SENTINEL): SentinelCutFill {
+  const block = sentinelBlock(text, name);
+  if (!block) return { action: "no_sentinel" };
+  const current = block.sentinel.cut_through_uuid;
+  if (typeof current === "string" && current.trim() !== "" && current !== CUT_PLACEHOLDER) {
+    if (pendingCut && current !== pendingCut) return { action: "mismatch", body_cut: current, pending_cut: pendingCut };
+    return { action: "kept", text, cut: current };
+  }
+  if (current !== undefined && current !== null && typeof current !== "string") return { action: "unfillable" };
+  const was = "cut_through_uuid" in block.sentinel ? "placeholder" : "missing";
+  if (!pendingCut) return { action: "no_pending", was };
+  const inner = text.slice(block.open, block.close + 1);
+  let filled: string;
+  if (was === "placeholder") {
+    // The field exists with the placeholder, an empty string or null: replace its value.
+    filled = inner.replace(/("cut_through_uuid"\s*:\s*)("(?:[^"\\]|\\.)*"|null)/, `$1${JSON.stringify(pendingCut)}`);
+  } else {
+    // No field: add it right after the sentinel's own key, which this block holds.
+    const m = sentinelRe(name, "y");
+    m.lastIndex = block.key - block.open;
+    if (!m.exec(inner)) return { action: "unfillable" };
+    filled = `${inner.slice(0, m.lastIndex)}, "cut_through_uuid": ${JSON.stringify(pendingCut)}${inner.slice(m.lastIndex)}`;
+  }
+  const out = text.slice(0, block.open) + filled + text.slice(block.close + 1);
+  if (parseSentinel(out, name)?.cut_through_uuid !== pendingCut) return { action: "unfillable" };
+  return { action: "filled", text: out, cut: pendingCut, was };
 }
 
 /**
@@ -200,7 +256,7 @@ export interface RecapStack {
   end: number;
 }
 
-/** The recap stack at the head of a session. Every recap counts, whoever signed it: none may be cut. */
+/** The recap stack at the head of a session. Every recap counts, whatever its voice or id: none may be cut. */
 export function scanRecapStack(records: ReadonlyArray<JsonlRecord | null | undefined>, sentinelName = DEFAULT_SENTINEL): RecapStack {
   const recaps: StackRecap[] = [];
   let i = 0;

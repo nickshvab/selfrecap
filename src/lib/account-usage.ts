@@ -1,7 +1,19 @@
 /**
  * Plan usage per Claude account: the bars `/usage` shows in Claude Code
  * ("Current session", "Current week (all models)", and a per-model week).
- * OFF BY DEFAULT: set `usage.enabled: true` in config.yaml to opt in.
+ * OFF BY DEFAULT: set `usage.enabled: true` in config.yaml to opt in. Two
+ * sources, chosen by `usage.source`:
+ *
+ * DOCUMENTED (the default): what Claude Code hands its status line command.
+ * For Pro, Max and Ultra subscribers its JSON carries `rate_limits` (the
+ * five-hour and seven-day windows, with used_percentage and resets_at), and
+ * scripts/usage-statusline.mjs, set as the status line, saves that object per
+ * account in ~/.selfrecap/usage/ (SELFRECAP_USAGE_DIR moves it). This server
+ * only reads those files: no credentials, no network, no model call. The
+ * numbers are as fresh as the last status line update on that account, and
+ * there is no per-model week.
+ *
+ * UNDOCUMENTED (usage.source: undocumented), described below:
  *
  * Source: GET https://api.anthropic.com/api/oauth/usage with the account's own
  * OAuth access token from <account>/.credentials.json. This is the endpoint
@@ -10,8 +22,8 @@
  * account and everything else keeps working. (The documented alternative, the
  * status line's `rate_limits`, carries only the session and the all-models
  * week, not the per-model weekly bar.) It may also refuse clients other than
- * Claude Code; this one says who it is (`selfrecap/<version>`) and reports the
- * refusal rather than pretending to be Claude Code.
+ * Claude Code; this one sends `User-Agent: selfrecap/<version>` and reports a
+ * refusal as one.
  *
  * Safety:
  *  - The token is read, sent only to api.anthropic.com (where Claude Code sends
@@ -28,8 +40,11 @@
  *    simply left out.
  */
 
+import crypto from "crypto";
 import fs from "fs";
+import os from "os";
 import path from "path";
+import type { UsageSource } from "../config.js";
 import { VERSION } from "../version.js";
 
 const ENDPOINT = "https://api.anthropic.com/api/oauth/usage";
@@ -53,6 +68,8 @@ export interface UsageWindow {
 export interface AccountUsage {
   /** Account folder name, e.g. .claude */
   account: string;
+  /** Where the numbers came from (config usage.source). */
+  source: UsageSource;
   plan: string | null;
   ok: boolean;
   error?: string;
@@ -109,7 +126,16 @@ async function fetchOne(account: string): Promise<void> {
   const prev = cache.get(name);
   const now = new Date().toISOString();
   const keep = (error: string) =>
-    cache.set(name, { account: name, plan: prev?.plan ?? null, ok: false, error, fetched_at: prev?.fetched_at ?? null, checked_at: now, windows: prev?.windows ?? [] });
+    cache.set(name, {
+      account: name,
+      source: "undocumented",
+      plan: prev?.plan ?? null,
+      ok: false,
+      error,
+      fetched_at: prev?.fetched_at ?? null,
+      checked_at: now,
+      windows: prev?.windows ?? [],
+    });
 
   let oauth: any;
   try {
@@ -160,7 +186,7 @@ async function fetchOne(account: string): Promise<void> {
       keep("usage endpoint answered, but with no limits in a shape this server knows");
       return;
     }
-    cache.set(name, { account: name, plan: oauth.subscriptionType ?? null, ok: true, fetched_at: now, checked_at: now, windows });
+    cache.set(name, { account: name, source: "undocumented", plan: oauth.subscriptionType ?? null, ok: true, fetched_at: now, checked_at: now, windows });
   } catch (e: any) {
     keep(`usage fetch failed: ${e?.name === "TimeoutError" ? "timeout" : (e?.message ?? e)}`);
   }
@@ -169,16 +195,89 @@ async function fetchOne(account: string): Promise<void> {
 let lastRefresh = 0;
 let inFlight: Promise<void> | null = null;
 
+// ─── The documented source: what the status line was handed ─────────────────
+
+/** Where scripts/usage-statusline.mjs keeps its readings. */
+export function usageDir(env: NodeJS.ProcessEnv = process.env): string {
+  return env.SELFRECAP_USAGE_DIR || path.join(os.homedir(), ".selfrecap", "usage");
+}
+
+/** The file one account's reading is kept in. Must match scripts/usage-statusline.mjs. */
+export function usageFileFor(account: string, dir = usageDir()): string {
+  const key = crypto.createHash("sha256").update(path.resolve(account).toLowerCase()).digest("hex").slice(0, 16);
+  return path.join(dir, `${key}.json`);
+}
+
+/** The windows in a status line's `rate_limits`, minus those whose reset time has passed. */
+export function parseStatusLineLimits(rl: any, now = Date.now()): UsageWindow[] {
+  const out: UsageWindow[] = [];
+  const add = (w: any, kind: string, label: string) => {
+    if (!w || typeof w.used_percentage !== "number") return;
+    const resets = typeof w.resets_at === "number" ? w.resets_at * 1000 : null;
+    // Claude Code drops a window once its reset time passes; a saved reading must too.
+    if (resets !== null && resets <= now) return;
+    out.push({ label, kind, percent: w.used_percentage, resets_at: resets === null ? null : new Date(resets).toISOString(), severity: null });
+  };
+  add(rl?.five_hour, "session", "Current session");
+  add(rl?.seven_day, "weekly_all", "Current week (all models)");
+  add(rl?.spend_limit, "spend_limit", "Spend limit");
+  return out;
+}
+
+/** One account's usage from the status line's last reading. Reads one small file; never throws. */
+export function documentedUsage(account: string, dir = usageDir(), now = Date.now()): AccountUsage | null {
+  const name = path.basename(account);
+  const checked = new Date(now).toISOString();
+  const base = { account: name, source: "documented" as const, plan: null, checked_at: checked };
+  let saved: any;
+  try {
+    saved = JSON.parse(fs.readFileSync(usageFileFor(account, dir), "utf8"));
+  } catch (e: any) {
+    if (e?.code !== "ENOENT") return { ...base, ok: false, error: "the saved status-line reading does not read", fetched_at: null, windows: [] };
+    if (!fs.existsSync(account)) return null; // no such account folder here: nothing to show
+    return {
+      ...base,
+      ok: false,
+      error:
+        "no status-line reading for this account yet: set scripts/usage-statusline.mjs as its status line (see docs/operations.md); " +
+        "Claude Code hands it the limits only for Pro, Max and Ultra subscriptions, after a session's first reply",
+      fetched_at: null,
+      windows: [],
+    };
+  }
+  const windows = parseStatusLineLimits(saved?.rate_limits, now);
+  const fetched = typeof saved?.captured_at === "string" ? saved.captured_at : null;
+  if (windows.length === 0) {
+    return { ...base, ok: false, error: `the last status-line reading (${fetched ?? "time unknown"}) has no window that is still open; it updates when a session on this account next gets a reply`, fetched_at: fetched, windows: [] };
+  }
+  return { ...base, ok: true, fetched_at: fetched, windows };
+}
+
 /**
- * The usage for these accounts, fetched on demand: only when someone asks
- * (a /contexts call), and at most once per REFRESH_MS. Nothing polls in the
- * background, so with nobody asking nothing calls the endpoint.
+ * The usage for these accounts, from the configured source. Documented: the
+ * status line's saved readings, read on each call (a few small files).
+ * Undocumented: fetched on demand: only when someone asks (a /contexts
+ * call), and at most once per REFRESH_MS. Nothing polls in the background,
+ * so with nobody asking nothing calls the endpoint.
  *
- * Returns the cache at once when it is fresh. When it is stale, a refresh
- * starts; the first call (empty cache) waits up to FIRST_WAIT_MS for it, later
- * calls return the previous numbers and the refresh lands for the next poll.
+ * Undocumented returns the cache at once when it is fresh. When it is stale,
+ * a refresh starts; the first call (empty cache) waits up to FIRST_WAIT_MS for
+ * it, later calls return the previous numbers and the refresh lands for the
+ * next poll.
  */
-export async function accountUsage(accounts: string[], log: { warn: (m: string) => void }): Promise<Record<string, AccountUsage>> {
+export async function accountUsage(
+  accounts: string[],
+  log: { warn: (m: string) => void },
+  source: UsageSource = "documented",
+): Promise<Record<string, AccountUsage>> {
+  if (source === "documented") {
+    const out: Record<string, AccountUsage> = {};
+    for (const a of accounts) {
+      const u = documentedUsage(a);
+      if (u) out[u.account] = u;
+    }
+    return out;
+  }
   if (Date.now() - lastRefresh >= REFRESH_MS && !inFlight) {
     lastRefresh = Date.now();
     inFlight = Promise.all(

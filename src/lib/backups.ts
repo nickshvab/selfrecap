@@ -63,7 +63,7 @@ export function writeVerifiedBackup(filePath: string, bytes: Buffer): void {
   }
 }
 
-/** Timestamp embedded in a backup name (`...-2026-09-22T01-08-16-344Z.jsonl`), in ms. */
+/** Timestamp embedded in a backup name (`...-2026-01-15T12-00-00-000Z.jsonl`), in ms. */
 function stampOf(name: string): number | null {
   const m = /(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})-(\d{3})Z/.exec(name);
   if (!m) return null;

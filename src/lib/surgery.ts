@@ -21,7 +21,13 @@
  *     1.1 only the next LINE was re-parented; when that line was metadata
  *     (last-prompt, file-history-snapshot) the resumed session never reached
  *     its recaps;
- *   - the cut separates no tool_use from a surviving tool_result;
+ *   - the cut separates no tool_use from a surviving tool_result. Records of
+ *     Claude Code's request log (api-request, api-request-blob,
+ *     api-request-shape: uuid-less copies of what was sent) are not counted:
+ *     they are written again each time a session is brought up from disk, so
+ *     counting them would refuse a cut made before the latest resume with
+ *     false orphans. Those inside the cut range go with it, like every line
+ *     there; those after it are kept untouched;
  *   - the file is not a frozen ancestor behind a broken continuation link.
  *
  * The swap, while the session keeps writing (self-surgery: the Bash call
@@ -55,7 +61,7 @@
 import fs from "fs";
 import path from "path";
 import crypto from "crypto";
-import { getRecordText, readSessionBytes, type JsonlRecord, type SessionBytes } from "./jsonl.js";
+import { getRecordText, isApiRequestRecord, readSessionBytes, type JsonlRecord, type SessionBytes } from "./jsonl.js";
 import {
   GENERATED_USER_TEXT,
   formatRecapId,
@@ -134,6 +140,12 @@ export interface SurgeryDiagnostics {
   chain_break: ChainBreak | null;
   /** tool_use ids the cut removes while their tool_result survives. */
   cut_orphaned_tool_results: string[];
+  /**
+   * Request-log records (api-request, api-request-blob, api-request-shape)
+   * inside the cut range. They go with the range; they are never counted in
+   * the tool-call checks, wherever they sit.
+   */
+  api_request_records_cut: number | null;
   file_size_before_bytes: number;
   file_size_after_bytes: number | null;
   /** Lines appended by the live session during surgery and carried into the new file. */
@@ -210,6 +222,7 @@ export function performSurgery(req: SurgeryRequest): SurgeryResult {
     chain_reaches_recap: null,
     chain_break: null,
     cut_orphaned_tool_results: [],
+    api_request_records_cut: null,
     file_size_before_bytes: 0,
     file_size_after_bytes: null,
     carried_tail_lines: null,
@@ -248,7 +261,7 @@ export function performSurgery(req: SurgeryRequest): SurgeryResult {
   // unhelpful "cut_through_uuid not found" in the other voice's file.
   if (req.voice && typeof sentinel?.voice === "string" && sentinel.voice.toLowerCase() !== req.voice) {
     return fail(
-      `sentinel_voice_mismatch: this body is signed "${sentinel.voice}", but this is ${req.voice}'s session. ` +
+      `sentinel_voice_mismatch: this body's sentinel names voice "${sentinel.voice}", but this is ${req.voice}'s session. ` +
         `Run it as ${sentinel.voice.toLowerCase()}, or fix the sentinel.`,
     );
   }
@@ -299,6 +312,7 @@ export function performSurgery(req: SurgeryRequest): SurgeryResult {
   }
   diag.lines_cut = cutIdx - stack.end + 1;
   diag.new_recap_position = stack.end;
+  diag.api_request_records_cut = recs.slice(stack.end, cutIdx + 1).filter(isApiRequestRecord).length;
 
   // ─── Body checks ───────────────────────────────────────────────────────────
 
@@ -505,6 +519,44 @@ export function performSurgery(req: SurgeryRequest): SurgeryResult {
   }
 
   return { ok: true, dry_run: false, diagnostics: diag, warnings };
+}
+
+/**
+ * The dry run's checklist, as `recap.ts --go --restart` reads it before it
+ * executes: every diagnostic the dry run prints that is not what /remember
+ * expects, as one plain sentence each. Empty means go.
+ *
+ * Stricter than the server: a recap in the cut range stops it even when
+ * force_overwrite_recap would let the surgery through (that needs the
+ * operator), and the stack the surgery keeps must be the one the plan showed.
+ */
+export function dryRunFailures(
+  result: { ok?: boolean; dry_run?: boolean; reason?: string; diagnostics?: Partial<SurgeryDiagnostics> | null },
+  stackSize: number | null,
+): string[] {
+  const d = result.diagnostics ?? {};
+  const out: string[] = [];
+  if (result.ok !== true) out.push(`ok is ${result.ok}: ${result.reason ?? "refused"}`);
+  if (result.dry_run === false) out.push("this was not a dry run");
+  if (d.recap_id && d.expected_recap_id && d.recap_id.toLowerCase() !== d.expected_recap_id.toLowerCase()) {
+    out.push(`recap_id ${d.recap_id} is not the expected ${d.expected_recap_id}`);
+  }
+  if (stackSize !== null && d.leading_recaps_preserved !== undefined && d.leading_recaps_preserved !== stackSize) {
+    out.push(`leading_recaps_preserved is ${d.leading_recaps_preserved}, but your plan's recap stack has ${stackSize}`);
+  }
+  if (typeof d.lines_cut !== "number" || d.lines_cut <= 0) out.push(`lines_cut is ${d.lines_cut ?? "missing"}: nothing would be cut`);
+  if (typeof d.new_recap_position !== "number") out.push("new_recap_position is missing");
+  if (d.chain_reaches_recap !== true) out.push(`chain_reaches_recap is ${d.chain_reaches_recap ?? "missing"}: the resumed session would not reach the recap`);
+  if ((d.cut_orphaned_tool_results ?? []).length > 0) {
+    out.push(`cut_orphaned_tool_results has ${d.cut_orphaned_tool_results!.length}: the cut splits a tool call`);
+  }
+  const pb = d.pair_balance;
+  if (!pb) out.push("pair_balance is missing");
+  else if (pb.orphans > 0 && !pb.tail_orphan_only) out.push(`pair_balance has ${pb.orphans} orphan(s), and not only your own call in flight`);
+  if (d.cut_range_has_existing_recap === true) {
+    out.push("cut_range_has_existing_recap is true: a recap is in the cut range. Stop and tell the operator");
+  }
+  return out;
 }
 
 /**
@@ -815,15 +867,23 @@ function contentBlocks(r: JsonlRecord | null | undefined): any[] {
   return Array.isArray(c) ? c : [];
 }
 
+/**
+ * The blocks the tool-call checks count: a request-log record's message is a
+ * copy of one already counted (or already cut), so it counts as nothing.
+ */
+function pairedBlocks(r: JsonlRecord | null | undefined): any[] {
+  return isApiRequestRecord(r) ? [] : contentBlocks(r);
+}
+
 /** tool_use ids in lines [from, cutIdx] whose tool_result survives after cutIdx. */
 function orphanedByCut(recs: ReadonlyArray<JsonlRecord | null>, from: number, cutIdx: number): string[] {
   const cutUses = new Set<string>();
   for (let i = from; i <= cutIdx; i++) {
-    for (const b of contentBlocks(recs[i])) if (b?.type === "tool_use" && b.id) cutUses.add(b.id);
+    for (const b of pairedBlocks(recs[i])) if (b?.type === "tool_use" && b.id) cutUses.add(b.id);
   }
   const orphaned: string[] = [];
   for (let i = cutIdx + 1; i < recs.length; i++) {
-    for (const b of contentBlocks(recs[i])) {
+    for (const b of pairedBlocks(recs[i])) {
       if (b?.type === "tool_result" && b.tool_use_id && cutUses.has(b.tool_use_id)) orphaned.push(b.tool_use_id);
     }
   }
@@ -836,7 +896,7 @@ function pairBalance(recs: ReadonlyArray<JsonlRecord | null>): NonNullable<Surge
   const useIds = new Set<string>();
   const resultIds = new Set<string>();
   for (const r of recs) {
-    for (const b of contentBlocks(r)) {
+    for (const b of pairedBlocks(r)) {
       if (b?.type === "tool_use" && b.id) {
         toolUse++;
         useIds.add(b.id);

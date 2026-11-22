@@ -88,10 +88,10 @@ describe("readContextSize reads the tail", () => {
     });
     expect(same(file("huge-record.jsonl", [assistant(10), huge, user("after")].join("\n") + "\n"))!.input_tokens).toBe(11);
 
-    // Cyrillic text across the 256 KB chunk edge: lines are cut on bytes, never inside a character.
+    // Multi-byte characters across the 256 KB chunk edge: lines are cut on bytes, never inside a character.
     for (const shift of [0, 1, 2, 3]) {
-      const pad = "я".repeat(131_000 + shift); // 2 bytes each, so the edge falls inside characters
-      same(file(`utf8-${shift}.jsonl`, [assistant(12), user(pad), user("ще")].join("\n") + "\n"));
+      const pad = "\u00e9".repeat(131_000 + shift); // 2 bytes each, so the edge falls inside characters
+      same(file(`utf8-${shift}.jsonl`, [assistant(12), user(pad), user("caf\u00e9")].join("\n") + "\n"));
     }
   });
 

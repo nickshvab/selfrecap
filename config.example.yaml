@@ -4,7 +4,9 @@
 #
 # config.yaml is git-ignored, so your real paths never get committed.
 # Read once at startup: after editing, run `npm run check-config`, then
-# restart the server.
+# restart the server. A nudge, usage or draft block that does not parse falls
+# back to its defaults: only a plain `enabled: true` keeps the nudger or the
+# usage bars on, and the draft is off (docs/options.md, "Other settings").
 
 server:
   port: 9090
@@ -13,10 +15,8 @@ server:
 # ─── Voices ──────────────────────────────────────────────────────────────────
 #
 # A "voice" is just a short, memorable name for one of your Claude Code
-# sessions. The term reflects this tool's origin — identity-preserving recaps
-# for long-lived AI personas, where each session is a recognizable voice. Call
-# them whatever you like (project-a, my-session, agent-1). Names are
-# case-insensitive.
+# sessions. Call them whatever you like (project-a, my-session, agent-1).
+# Names are case-insensitive.
 #
 #   session  the session's JSONL transcript (`path` is accepted too, its 1.0 name).
 #            An anchor: when Claude Code continues a session into a new file,
@@ -30,10 +30,14 @@ server:
 #            {session_id} becomes the LIVE session id. Resume by id only
 #            (`--resume {session_id}`, never --continue), and give --name.
 #            `recap.ts --go` prints it for the operator; on Windows,
-#            `selfrecap restart` runs exactly this (see README).
+#            `selfrecap restart` runs this, with a resume prompt added (see docs/operations.md).
 #   name     optional: the name the session answers to (`claude --name`).
 #            Defaults to the key, capitalized. The nudger and
-#            `selfrecap restart` find live sessions by it.
+#            `selfrecap restart` find live sessions by it. A letter, then
+#            letters, digits, - and _ only; otherwise the voice is skipped.
+#
+# A broken voice entry is reported (check-config, the startup log, /health,
+# /voices) and left out; the other voices keep working.
 #
 # HOW TO FIND YOUR SESSION JSONL:
 #   Claude Code stores each session at:
@@ -80,9 +84,12 @@ voices:
 # files you didn't intend. Read SECURITY.md before exposing this beyond
 # localhost (don't, without adding TLS + real auth).
 
-# Only files resolving (after symlink resolution) under one of these roots may
-# be read or written. Leave as-is unless your sessions live elsewhere (another
-# Claude Code account folder, for instance: add its projects/ folder here).
+# A session file a request names, or a voice resolves to, must end in .jsonl and
+# resolve (after symlink resolution) under one of these roots before it is read
+# or rewritten. Leave as-is unless your sessions live elsewhere (another Claude
+# Code account folder, for instance: add its projects/ folder here). The
+# nudger's context reading and the size /voices reports come from the files
+# named above without this check (see SECURITY.md, section 2).
 allowed_roots:
   - "~/.claude/projects/"
 
@@ -90,7 +97,7 @@ allowed_roots:
 # /contexts, /context, the recap plan's session paths and surgery diagnostics —
 # so a misconfigured public clone can't leak your home directory layout. Set
 # true only on a trusted local dashboard. (The recap plan always carries the
-# body path: the session needs it to write its recap.)
+# voice's own folders and its body path in full: the session writes there.)
 expose_paths: false
 
 # ─── Recap sentinel ──────────────────────────────────────────────────────────
@@ -127,7 +134,7 @@ accounts:
 # one-shot `claude -p` on `model`, in the session's own account, which carries
 # a fixed text with SendMessage. Needs Claude Code with cross-session
 # messaging (v2.1.224+, native Windows v2.1.234+). Windows only: liveness is
-# read from Claude Code's Windows named pipes (see README).
+# read from Claude Code's Windows named pipes (see docs/operations.md).
 nudge:
   enabled: false
   at: 83
@@ -137,10 +144,50 @@ nudge:
 
 # ─── Plan-usage bars (off by default) ────────────────────────────────────────
 #
-# When on, /contexts adds `account_usage`: the bars Claude Code's /usage shows
-# (session, week, per model) for each account. To get them the server READS
-# each account's login token from <account>/.credentials.json and calls an
-# undocumented Anthropic endpoint with it; it never refreshes the token. The
-# endpoint may change or stop answering without notice. See README.
+# When on, /contexts adds `account_usage`: the plan-usage bars for each
+# account. Nothing in selfrecap acts on them: they are for you or a dashboard.
+# Two sources (see docs/options.md, "Plan-usage bars", for the steps):
+#
+#   documented    (the default) what Claude Code hands its status line: the
+#                 five-hour and seven-day windows. Set
+#                 `node <selfrecap-dir>/scripts/usage-statusline.mjs` as the
+#                 status line of each account; it saves them to
+#                 ~/.selfrecap/usage/ and the server reads them. No credentials,
+#                 no network, no model call. Pro, Max and Ultra plans only.
+#   undocumented  Claude Code's own /usage endpoint: adds the per-model week.
+#                 The server READS each account's login token from
+#                 <account>/.credentials.json and calls an undocumented Anthropic
+#                 endpoint with it (never refreshing the token). It may change,
+#                 refuse this client or stop answering without notice.
 usage:
   enabled: false
+  source: documented
+
+# ─── The draft and the check (off by default) ───────────────────────────────
+#
+# `recap.ts <voice> --draft`: before writing its recap, a session has a cold
+# reader (a headless `claude -p` run) read the period being cut and write a
+# draft of short lines (what was learned, decided, who said it), which the
+# session reads before writing the body itself. `recap.ts <voice> --check`:
+# after writing, one cold checker compares the body with the record and
+# reports what does not fit. Both run on the account of the session that runs
+# recap.ts and are billed like any `claude -p` run there (API credit when
+# ANTHROPIC_API_KEY is set); every run prints its own cost. They need Claude
+# Code 2.1.314 or later and a recaps folder for the voice. Read SECURITY.md,
+# "The draft and the check", before turning them on.
+#
+# The environment variable SELFRECAP_DRAFT=1 (or 0) overrides `enabled` for
+# the process it is set in; the environment wins over this file.
+draft:
+  enabled: false
+  # One reader over the whole period. It assumes a model with a context window
+  # of about 1M tokens: a timeline up to 1,000,000 characters goes to one
+  # reader, a longer one to the fewest parts under that size. With a smaller
+  # window use `--draft --split`.
+  reader_model: opus
+  # The readers' model with --split: parts of about 230,000 characters, up to 4 at once.
+  split_reader_model: sonnet
+  check_model: opus
+  # What the timeline and the readers' briefs call the person the session works
+  # with (at most 60 characters).
+  operator: the operator

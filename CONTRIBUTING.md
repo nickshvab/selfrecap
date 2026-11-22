@@ -4,10 +4,10 @@ Thanks for your interest. This is a small, focused TypeScript server, and contri
 
 ## Development setup
 
-Requirements: Node.js >= 20.
+Requirements: Node.js >= 20.1.
 
 ```bash
-git clone https://github.com/kshvab/selfrecap.git selfrecap
+git clone https://github.com/nickshvab/selfrecap.git selfrecap
 cd selfrecap
 npm install
 cp config.example.yaml config.yaml
@@ -21,7 +21,7 @@ Useful scripts (see `package.json`):
 
 - `npm start` — run the server
 - `npm run dev` — run with reload on change
-- `npm run typecheck` — `tsc --noEmit`
+- `npm run typecheck` — `tsc --noEmit -p tsconfig.test.json` (src, scripts and tests)
 - `npm test` — run the test suite (Vitest)
 - `npm run test:watch` — tests in watch mode
 - `npm run build` — compile to `dist/`
@@ -43,21 +43,30 @@ src/
     monitor.ts         context-size computation
     continuation.ts    following continued-in markers to the live session file
     recap-plan.ts      the recap plan and headroom
+    pending-cut.ts     the pending cut: saving it, finding it in the session
+    next-command.ts    the recap.ts commands printed for the session to run next
     surgery.ts         cut + inject + re-parent, the safety checks, the swap under a live session
     backups.ts         verified backups and their rotation
     fsutil.ts          durable writes, range reads
+    timeline.ts        the period rewritten as numbered entries, for the draft and the check
+    draft.ts           the draft and the check: work folders, briefs, readers, merge, checker
+    headless.ts        the fenced headless claude -p runs and the Claude Code version check
     sessions.ts        Claude Code's live-session registry (Windows liveness)
     lifecycle.ts       process handling for selfrecap restart (Windows)
+    restart.ts         scheduling a restart: who is calling, the checks, the lock, the helper launch
     lifecycle-log.ts   nudge/restart events
     nudger.ts          the context nudge (Windows, opt-in)
     account-usage.ts   plan-usage bars (opt-in)
 scripts/
   recap.ts             the CLI a session drives the recap cycle with
-  selfrecap.ts         selfrecap restart / log (Windows)
+  selfrecap.ts         selfrecap restart / log (Windows), and the restart helper's own step
   check-config.ts      validate config.yaml
   install-skill.ts     install the /remember skill into each account
+  check-headless-fence.ts  check that Claude Code keeps a headless run inside its folder
+  usage-statusline.mjs status line command that saves the plan-usage windows (plain Node)
+skills/remember/       the /remember skill
 tests/                 Vitest tests + JSONL fixtures
-docs/                  protocol, walkthrough, and field-note guides
+docs/                  API and protocol reference, operations, walkthrough, and writing guides
 ```
 
 ## How to add a route
@@ -68,7 +77,7 @@ docs/                  protocol, walkthrough, and field-note guides
    - Keep the heavy lifting in a `src/lib/` function so it can be unit-tested independently of HTTP.
 2. Register it in `src/server.ts` alongside the existing `register*` calls.
 3. Add tests under `tests/` against the JSONL fixture.
-4. Update the API surface section of `README.md` and, if you change the record or sentinel shape, `docs/protocol.md`.
+4. Update the API reference in `docs/api.md` and, if you change the record or sentinel shape, `docs/protocol.md`.
 
 ## Testing
 
@@ -83,8 +92,8 @@ The suite runs against hand-crafted JSONL fixtures in `tests/`. When you touch `
 - Keep PRs focused — one logical change per PR.
 - Run `npm run typecheck` and `npm test` before pushing; both must pass.
 - Write a clear description: what changed and why. Link any related issue.
-- If you add or change an endpoint, update `README.md` and `docs/protocol.md` in the same PR.
-- Do not commit `config.yaml`, real transcript files, backups, or anything containing personal paths or session IDs.
+- If you add or change an endpoint, update `docs/api.md` and `docs/protocol.md` in the same PR.
+- Do not commit `config.yaml`, real transcript files, backups, or anything containing paths from your own machine or session IDs.
 - New behavior needs a test. Bug fixes should include a test that fails before the fix.
 
 ## Code style

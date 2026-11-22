@@ -35,6 +35,22 @@ export interface JsonlRecord {
 }
 
 /**
+ * Records of the request log Claude Code keeps beside the conversation:
+ * `api-request` (one per call to the model), `api-request-blob` (a message as
+ * it was sent, stored once by hash) and `api-request-shape` (the system prompt
+ * and tools). They carry no uuid and are not in the parentUuid chain. A blob
+ * is a COPY of a message, old tool calls and tool results included, and blobs
+ * are written again whenever a session is brought up from disk, so a blob
+ * after the cut can hold a copy of a tool result whose tool_use is before it.
+ */
+export const API_REQUEST_TYPES: ReadonlySet<string> = new Set(["api-request", "api-request-blob", "api-request-shape"]);
+
+/** A uuid-less record of the request log (see API_REQUEST_TYPES): a copy, never part of the conversation. */
+export function isApiRequestRecord(r: JsonlRecord | null | undefined): boolean {
+  return !!r && !r.uuid && typeof r.type === "string" && API_REQUEST_TYPES.has(r.type);
+}
+
+/**
  * Load a JSONL file and parse each line, for read-only callers (monitor,
  * finder, planner). A line that fails to parse becomes an empty `{}`
  * placeholder so indices stay aligned with file lines. Never write these
@@ -155,7 +171,7 @@ export interface RecordSummary {
   content_preview: string;
   /**
    * True if this record can be used as a cut point in surgery (has a uuid).
-   * False for records like fakechat channel envelopes that lack uuid in JSONL —
+   * False for records like channel message envelopes that lack uuid in JSONL —
    * AI should not pick these as cut_through_uuid targets.
    */
   selectable: boolean;

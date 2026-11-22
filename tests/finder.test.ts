@@ -10,7 +10,8 @@ import {
   findAnchorOffset,
   findCutPoint,
 } from "../src/lib/finder.js";
-import { FIXTURE_PATH, SENTINEL } from "./helpers.js";
+import { isApiRequestRecord } from "../src/lib/jsonl.js";
+import { FIXTURE_PATH, SENTINEL, Session, tmpDir } from "./helpers.js";
 
 describe("findMarkerPhrase", () => {
   it("finds the unique marker phrase at its record", () => {
@@ -82,5 +83,31 @@ describe("before_timestamp filter (via findCutPoint)", () => {
     );
     expect(filtered.total_matches).toBe(1);
     expect(filtered.matches[0]?.uuid).toBe("sess-uuid-15");
+  });
+});
+
+describe("the request log", () => {
+  it("isApiRequestRecord: only the uuid-less request-log types", () => {
+    expect(isApiRequestRecord({ type: "api-request-blob", message: { role: "user", content: [] } })).toBe(true);
+    expect(isApiRequestRecord({ type: "api-request-shape" })).toBe(true);
+    expect(isApiRequestRecord({ type: "api-request" })).toBe(true);
+    expect(isApiRequestRecord({ type: "api-request-blob", uuid: "u" }), "a record with a uuid is in the chain").toBe(false);
+    expect(isApiRequestRecord({ type: "queue-operation" })).toBe(false);
+    expect(isApiRequestRecord({ type: "user", uuid: "u" })).toBe(false);
+    expect(isApiRequestRecord(null)).toBe(false);
+  });
+
+  it("a phrase search does not match the request log's copy of a message", () => {
+    const dir = tmpDir();
+    const s = new Session();
+    s.user("hello");
+    s.assistant("hi");
+    const typed = s.user("the boundary message with six distinctive words");
+    s.requestBlob({ role: "user", content: [{ type: "text", text: "the boundary message with six distinctive words" }] });
+    s.assistant("ok");
+    const file = s.write(dir);
+    const r = findCutPoint(file, { method: "marker_phrase", phrase: "six distinctive words" }, SENTINEL);
+    expect(r.total_matches).toBe(1);
+    expect(r.matches[0]!.uuid).toBe(typed.uuid);
   });
 });

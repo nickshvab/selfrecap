@@ -8,9 +8,14 @@
  *
  * All methods support `excludeRecap` to skip injected recap records (see
  * isRecapRecord in recaps.ts; the sentinel name is config.sentinel_name).
+ * None of them returns a record of Claude Code's request log
+ * (isApiRequestRecord): those are uuid-less copies of messages that are
+ * elsewhere in the file, never a cut point, and they would make every phrase
+ * from a resumed session match twice.
  */
 
 import {
+  isApiRequestRecord,
   loadJsonl,
   getRecordText,
   recordSummary,
@@ -49,6 +54,7 @@ export function findMarkerPhrase(
   const matches: Match[] = [];
   for (let i = 0; i < records.length; i++) {
     const r = records[i]!;
+    if (isApiRequestRecord(r)) continue;
     if (excludeRecap && isRecapRecord(r, sentinelName)) continue;
     const text = getRecordText(r);
     if (text.includes(phrase)) {
@@ -71,6 +77,7 @@ export function findTimestampBefore(
   let lastIdx = -1;
   for (let i = 0; i < records.length; i++) {
     const r = records[i]!;
+    if (isApiRequestRecord(r)) continue;
     if (excludeRecap && isRecapRecord(r, sentinelName)) continue;
     if (!r.timestamp) continue;
     const t = new Date(r.timestamp).getTime();
@@ -121,7 +128,7 @@ export interface FindSpec {
   /**
    * Filter out matches with timestamp >= this ISO timestamp.
    * Useful for excluding self-contamination from current session activity.
-   * Example: `before_timestamp: "2026-05-07T22:58:00Z"` to find pre-test data only.
+   * Example: `before_timestamp: "2026-01-15T12:00:00Z"` to find only what came before that moment.
    */
   before_timestamp?: string;
 }

@@ -14,7 +14,7 @@ Claude Code stores each session as a [JSON Lines](https://jsonlines.org/) file: 
 
 where `<encoded-cwd>` is the session's working directory with every character that is not a letter or digit replaced by a dash.
 
-When Claude Code continues a session into a new file, it appends a record `{"type":"continued-in","continuedInSessionId":"<new id>"}` to the old one and stops writing it. selfrecap follows these records from a voice's configured file to the live one (see the README, "Session continuation").
+When Claude Code continues a session into a new file, it appends a record `{"type":"continued-in","continuedInSessionId":"<new id>"}` to the old one and stops writing it. selfrecap follows these records from a voice's configured file to the live one (see [operations.md](./operations.md#session-continuation)).
 
 `selfrecap` reads these files to measure context size and locate cut points, and (only via `/surgery`) rewrites them. It never invents transcript structure — it preserves whatever Claude Code wrote, byte for byte, and only cuts records, inserts one new record, and re-points the parents of records whose parent was cut.
 
@@ -60,7 +60,7 @@ When `/surgery` injects a recap, the new record is a `user` message whose conten
 
 A **recap record** is a `user` record (not `isMeta`) whose content is a plain string carrying `"sentinel": "<sentinel_name>"` (any spacing). Recognition does not require the block to parse, so recaps written by 1.0 with a slightly broken block stay recognized and protected. A **new** body is held to more: its sentinel must parse as JSON. When a body contains several sentinel objects (quoting a predecessor, say), the **last** one counts; if that last one does not parse, the body has no sentinel (it never falls back to the quoted one).
 
-Not recaps, even when they contain the sentinel text: a `tool_result` that read a body file, assistant text, a `queue-operation`, text Claude Code generates itself (slash-command echoes, task notifications, interrupt markers), or a sentinel-shaped string that is not a JSON object. Before 1.1 any record whose text contained the sentinel counted, which made the overwrite guard fire on routine work.
+Not recaps, even when they contain the sentinel text: a `tool_result` that read a body file, assistant text, a `queue-operation`, a meta record, or text Claude Code generates itself (slash-command echoes, task notifications, interrupt markers). A message typed by a user whose text contains `"sentinel": "<sentinel_name>"` does count, whether or not it is a JSON object: inside a cut range it is refused as `cut_range_contains_recap`, and at the head of the file it joins the stack. Before 1.1 any record whose text contained the sentinel counted, which made the overwrite guard fire on routine work.
 
 ### Sentinel shape
 
@@ -68,15 +68,11 @@ Not recaps, even when they contain the sentinel text: a `tool_result` that read 
 {
   "sentinel": "RECAP-CYCLE",
   "voice": "my-session",
-  "id": "my-session-recap-001",
+  "id": "my-session-recap-002",
   "version": 1,
   "cut_through_uuid": "<uuid of the last record being cut>",
   "period_covered": "2026-01-01_to_2026-01-15",
-  "generated": "2026-01-15",
-  "next_recap_should_skip_this": true,
-  "format": "pointer-plus-narrative-hybrid",
-  "mode": "A-first-person",
-  "predecessor_recap": "my-session-recap-000"
+  "predecessor_recap": "my-session-recap-001"
 }
 ```
 
@@ -85,11 +81,13 @@ Not recaps, even when they contain the sentinel text: a `tool_result` that read 
 | `sentinel` | yes | The marker name. Must match the server's configured `sentinel_name` (default `RECAP-CYCLE`). This is what the tool matches on. |
 | `voice` | recommended | The session's voice name. When given and the request names a voice, they must match (`sentinel_voice_mismatch`). |
 | `id` | recommended | `<voice>-recap-NNN`. For a voice, the server requires the next number in the session's recap stack (`sentinel_id_mismatch` names the expected id); the recap plan gives it. Without an id the surgery still runs, with a warning. |
-| `cut_through_uuid` | yes (for the CLI helper) | The `uuid` of the last record cut. The `scripts/recap.ts` helper extracts this from the body so you don't pass it twice; if both are given they must agree. |
+| `cut_through_uuid` | yes (for the CLI helper) | The `uuid` of the last record cut. The `scripts/recap.ts` helper extracts this from the body so you don't pass it twice; if both are given they must agree. In a body file it may be the placeholder `"CUT_UUID"` (or be left out): the helper fills in the pending cut that `--find` or `--cut` saved, in the file, before the dry run, `--go` or `--check`. |
 | `period_covered` | recommended | Human-readable date span of what this recap summarizes. |
 | `predecessor_recap` | for recap-002+ | The id of the prior recap this one layers on top of. Omit for the first recap. |
+| `version` | recommended | The sentinel format version, `1`. Not read yet; reserved for a format change (see [Versioning](#versioning)). |
+| `generated`, `next_recap_should_skip_this`, `format`, `mode` | no | Written by earlier versions of the `/remember` skill. Accepted and not read. |
 
-`sentinel` is what makes a record a recap; `voice`, `id` and `cut_through_uuid` are checked as above. The rest is metadata that helps future readers (you, or the next instance of the session) understand the recap's scope. The body **prose** before the JSON block is the actual recap — written in the session's own voice.
+`sentinel` is what makes a record a recap; `voice`, `id` and `cut_through_uuid` are checked as above, and the recap plan shows `period_covered`. The rest is metadata that helps later readers (you, or the resumed session) understand the recap's scope. The body **prose** before the JSON block is the actual recap — written by the session, in its own words.
 
 ### Configurable sentinel name
 
@@ -112,7 +110,7 @@ Before recap-002:                After recap-002:
 [period-3 verbatim]
 ```
 
-Every recap at the head counts, whoever signed it: none of them may be cut. The next recap number is one past the highest numbered id in the stack (or the stack size plus one when some ids carry no number).
+Every recap at the head counts, whatever its voice or id: none of them may be cut. The next recap number is one past the highest numbered id in the stack (or the stack size plus one when some ids carry no number).
 
 Surgery diagnostics report `leading_recaps_preserved` (the size of the stack) and `new_recap_position` (the line index where the new recap was inserted: after the stack and any header records, so it can be larger than `leading_recaps_preserved`).
 

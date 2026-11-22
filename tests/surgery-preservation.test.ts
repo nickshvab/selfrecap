@@ -198,7 +198,7 @@ describe("surgery byte-preservation (survivors)", () => {
   it("CRLF input produces a consistent CRLF file — no mixed \\r\\n / \\n endings", async () => {
     // Before the eol-detection fix, verbatim survivors kept their \r\n while the
     // re-serialized recap + first survivor were joined with bare \n, producing a
-    // mixed-ending file. Real CC transcripts are LF-only, but a stranger's editor
+    // mixed-ending file. Real CC transcripts are LF-only, but another editor
     // or git autocrlf could hand the tool a CRLF transcript; the output must stay
     // single-ending either way.
     const lines = [

@@ -31,7 +31,7 @@ const STATE_FILE = () => path.join(LOG_DIR, "lifecycle-state.json");
  *   nudged            the nudger's courier delivered the recap-and-restart message
  *   nudge_failed      the courier did not deliver it
  *   restart_overdue   a recap was applied, but the old process is still running long after
- *   over_ceiling      past 95%: too tight to recap cleanly; needs the operator (trim first)
+ *   over_ceiling      past 95%: too tight to recap cleanly; needs the operator
  *   restart_scheduled the session ran `selfrecap restart`; waiting for it to go idle
  *   resumed           the session is back: expected id, expected name, live, not stuck
  *   resume_failed     the resume did not come up, came up stuck, or its helper died

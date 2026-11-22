@@ -7,10 +7,13 @@ import { describe, it, expect } from "vitest";
 import fs from "fs";
 import os from "os";
 import path from "path";
-import { checkRestart, getVoice, isFatalProblem, loadConfig, resolvePath, restartCommandFor } from "../src/config.js";
-import { RESERVE_TOKENS, buildRecapPlan, headroomFor } from "../src/lib/recap-plan.js";
+import { DRAFT_DEFAULTS, checkRestart, getVoice, isFatalProblem, loadConfig, resolvePath, restartCommandFor } from "../src/config.js";
+import { RESERVE_TOKENS, buildRecapPlan, headroomFor, selfRestartFor } from "../src/lib/recap-plan.js";
 import { recordsAround } from "../src/lib/finder.js";
-import { Session, configFor, tmpDir } from "./helpers.js";
+import { DRAFT_CHARS_PER_TOKEN, DRAFT_SHARE_OF_TIMELINE, timelineChars } from "../src/lib/draft.js";
+import { savePendingCut } from "../src/lib/pending-cut.js";
+import { scanRecapStack } from "../src/lib/recaps.js";
+import { SENTINEL, Session, configFor, tmpDir } from "./helpers.js";
 
 const slash = (p: string) => p.replace(/\\/g, "/");
 
@@ -75,6 +78,28 @@ describe("loadConfig", () => {
     const cfg = loadConfig(writeConfig(dir, 'voices: {}\nusage:\n  enabled: "yes"\n'));
     expect(cfg.usage.enabled).toBe(false);
     expect(cfg.problems.some((p) => p.startsWith("usage:"))).toBe(true);
+  });
+
+  it("usage: the documented source by default; the undocumented one only when a valid block names it", () => {
+    const dir = tmpDir();
+    expect(loadConfig(writeConfig(dir, "voices: {}\n")).usage).toEqual({ enabled: false, source: "documented" });
+    expect(loadConfig(writeConfig(dir, "voices: {}\nusage:\n  enabled: true\n")).usage).toEqual({ enabled: true, source: "documented" });
+    expect(loadConfig(writeConfig(dir, "voices: {}\nusage:\n  enabled: true\n  source: undocumented\n")).usage).toEqual({ enabled: true, source: "undocumented" });
+    const bad = loadConfig(writeConfig(dir, "voices: {}\nusage:\n  enabled: true\n  source: secret-endpoint\n"));
+    expect(bad.usage, "a broken block never falls back to reading credentials").toEqual({ enabled: true, source: "documented" });
+    expect(bad.problems.some((p) => p.startsWith("usage:"))).toBe(true);
+  });
+
+  it("draft: off by default; models and the operator's name from the block; a broken block stays off", () => {
+    const dir = tmpDir();
+    expect(loadConfig(writeConfig(dir, "voices: {}\n")).draft).toEqual(DRAFT_DEFAULTS);
+    expect(DRAFT_DEFAULTS).toEqual({ enabled: false, reader_model: "opus", split_reader_model: "sonnet", check_model: "opus", operator: "the operator" });
+    const on = loadConfig(writeConfig(dir, "voices: {}\ndraft:\n  enabled: true\n  reader_model: sonnet\n  operator: Sam\n"));
+    expect(on.draft).toEqual({ ...DRAFT_DEFAULTS, enabled: true, reader_model: "sonnet", operator: "Sam" });
+    expect(on.problems).toEqual([]);
+    const bad = loadConfig(writeConfig(dir, "voices: {}\ndraft:\n  enabled: true\n  readers: 3\n"));
+    expect(bad.draft.enabled, "a block with a typo never switches on runs that cost money").toBe(false);
+    expect(bad.problems.some((p) => p.startsWith("draft:") && p.endsWith("OFF"))).toBe(true);
   });
 
   it("isFatalProblem: skipped entries and a broken voices block are fatal, ignored keys are not", () => {
@@ -260,10 +285,10 @@ describe("recap plan", () => {
     expect(plan.warnings.some((w) => w.startsWith("the session file is outside allowed_roots"))).toBe(true);
   });
 
-  it("counts a written body in characters, not bytes (Cyrillic is two bytes each)", () => {
+  it("counts a written body in characters, not bytes (multi-byte characters take two or three bytes each)", () => {
     const { home, cfg } = voiceSetup(["alice-recap-001"]);
     fs.writeFileSync(path.join(home, "recap-001.body.txt"), "x");
-    const body = "Γεια σου, Αλίκη. Привет. ".repeat(10);
+    const body = "\u00e9\u2192 ".repeat(50); // 2 + 3 + 1 bytes for 3 characters
     fs.writeFileSync(path.join(home, "recap-002.body.txt"), body);
     const plan = buildRecapPlan(cfg, "alice");
     expect(plan.next.body_exists).toBe(true);
@@ -286,6 +311,92 @@ describe("headroom", () => {
     expect(tight.tight).toBe(true);
     expect(headroomFor(960_000).body_budget_chars).toBe(0);
     expect(headroomFor(990_000).tokens_to_ceiling).toBe(0);
+  });
+
+  it("a draft still to read is counted, so TIGHT and NO ROOM include it", () => {
+    const without = headroomFor(800_000);
+    const withDraft = headroomFor(800_000, 23_000);
+    expect(withDraft.draft_tokens).toBe(23_000);
+    expect(without.draft_tokens).toBe(0);
+    expect(withDraft.body_budget_chars).toBe(Math.floor((170_000 - RESERVE_TOKENS - 23_000) * 2.5));
+    expect(headroomFor(900_000).tight).toBe(false);
+    expect(headroomFor(900_000, 23_000).tight, "reading the draft is what makes it tight").toBe(true);
+  });
+});
+
+describe("recap plan: the draft", () => {
+  it("off unless asked for: the plan is the one without the draft", () => {
+    const { cfg } = voiceSetup(["alice-recap-001"]);
+    const plan = buildRecapPlan(cfg, "alice");
+    expect(plan.draft).toBeNull();
+    if (plan.headroom) expect(plan.headroom.draft_tokens).toBe(0);
+    expect(buildRecapPlan(cfg, "alice", new Date(), { draft: false }).draft).toBeNull();
+  });
+
+  it("estimated before it is made, its real size after, counted in headroom until it is read", () => {
+    const { s, home, cfg, projects } = voiceSetup(["alice-recap-001"]);
+    fs.writeFileSync(path.join(home, "recap-001.body.txt"), "x");
+    s.user("a long talk about the next cut ".repeat(40));
+    s.assistantWithUsage("an answer", 500_000);
+    s.write(projects);
+    const logDir = tmpDir();
+    const on = { draft: true, logDir };
+
+    // No pending cut: the estimate runs up to now.
+    const now = buildRecapPlan(cfg, "alice", new Date(), on);
+    const d = now.draft!;
+    expect(d.exists).toBe(false);
+    expect(d.estimated).toBe(true);
+    expect(d.up_to).toBe("now");
+    expect(d.path, "in the voice's own drafts folder").toBe(slash(path.join(home, "drafts", "draft-for-alice-recap-002.md")));
+    const stackEnd = scanRecapStack(s.recs, SENTINEL).end;
+    expect(stackEnd).toBe(2);
+    expect(d.timeline_chars).toBe(timelineChars(s.recs, stackEnd, s.recs.length - 1, { operator: "the operator", voice: now.name }, { sentinel: SENTINEL }).chars);
+    expect(d.chars).toBe(Math.round(d.timeline_chars! * DRAFT_SHARE_OF_TIMELINE));
+    expect(d.tokens).toBe(Math.ceil(d.chars / DRAFT_CHARS_PER_TOKEN));
+    expect(now.headroom!.draft_tokens, "an estimate is shown, not counted").toBe(0);
+    expect(d.body_budget_after_chars).toBe(headroomFor(now.context!.tokens_total, d.tokens).body_budget_chars);
+
+    // A pending cut: up to it.
+    const hello = s.recs.find((r) => r.type === "assistant" && r.message.content[0].text === "hello")!;
+    savePendingCut({ voice: "alice", cut_uuid: hello.uuid, session_id: s.sessionId, line: null, record: null, boundary: null, source: "cut" }, logDir);
+    const upTo = buildRecapPlan(cfg, "alice", new Date(), on).draft!;
+    expect(upTo.up_to).toBe("pending_cut");
+    expect(upTo.timeline_chars!, "the talk after the cut is not in it").toBeLessThan(d.timeline_chars!);
+
+    // Written: its real size, counted in headroom.
+    const file = path.join(home, "drafts", "draft-for-alice-recap-002.md");
+    fs.mkdirSync(path.dirname(file));
+    fs.writeFileSync(file, "→ ".repeat(2500));
+    fs.utimesSync(file, new Date("2025-08-01T00:00:00Z"), new Date("2025-08-01T00:00:00Z"));
+    const written = buildRecapPlan(cfg, "alice", new Date(), on);
+    expect(written.draft!.exists).toBe(true);
+    expect(written.draft!.chars, "characters, not bytes (an arrow is three bytes)").toBe(5000);
+    expect(written.draft!.unread_tokens).toBe(written.draft!.tokens);
+    expect(written.headroom!.draft_tokens).toBe(written.draft!.tokens);
+    expect(written.headroom!.body_budget_chars).toBe(headroomFor(written.context!.tokens_total, written.draft!.tokens).body_budget_chars);
+
+    // Read since it was written: already in the context reading, not counted twice.
+    s.chained("assistant", { message: { role: "assistant", content: [{ type: "tool_use", id: "toolu_read", name: "Read", input: { file_path: slash(file) } }] } });
+    s.toolResult("toolu_read", "→ ".repeat(2500));
+    s.write(projects);
+    const read = buildRecapPlan(cfg, "alice", new Date(), on);
+    expect(read.draft!.unread_tokens).toBe(0);
+    expect(read.headroom!.draft_tokens).toBe(0);
+
+    // No recaps folder: no draft, there is no shared place for it.
+    delete (cfg.voices.alice as any).home;
+    expect(buildRecapPlan(cfg, "alice", new Date(), on).draft).toBeNull();
+  });
+
+  it("self_restart: Windows, a restart command, and one that passes its checks", () => {
+    const entry = { session: path.join(os.homedir(), ".claude", "projects", "-work-app", "a.jsonl"), restart: "cd /work/app; claude --resume {session_id} --name Alice" };
+    expect(selfRestartFor("alice", entry, "linux")).toMatchObject({ available: false, reason: expect.stringMatching(/Windows-only/) });
+    expect(selfRestartFor("alice", { session: entry.session }, "win32")).toMatchObject({ available: false, reason: expect.stringMatching(/no restart command/) });
+    expect(selfRestartFor("alice", { ...entry, restart: "claude --resume abc" }, "win32")).toMatchObject({ available: false, reason: expect.stringMatching(/fails its checks/) });
+    expect(selfRestartFor("alice", entry, "win32")).toMatchObject({ available: true });
+    const { cfg } = voiceSetup([]);
+    expect(buildRecapPlan(cfg, "alice").self_restart.available, "the plan reports it for this platform").toBe(process.platform === "win32");
   });
 });
 

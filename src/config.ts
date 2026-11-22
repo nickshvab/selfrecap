@@ -60,9 +60,36 @@ export interface NudgeConfig {
   model: string;
 }
 
-/** Plan-usage bars per Claude account (reads each account's login token). Off by default. */
+/**
+ * Where the plan-usage bars come from:
+ *   documented    what Claude Code hands its status line command (`rate_limits`),
+ *                 saved by scripts/usage-statusline.mjs. Reads no credentials.
+ *   undocumented  Claude Code's own /usage endpoint, called with each account's
+ *                 login token. Fuller (a per-model week), not a public API.
+ */
+export type UsageSource = "documented" | "undocumented";
+
+/** Plan-usage bars per Claude account. Off by default. */
 export interface UsageConfig {
   enabled: boolean;
+  source: UsageSource;
+}
+
+/**
+ * The draft before a recap and the check after it (recap.ts --draft and
+ * --check): headless Claude Code runs on the session's own account. Off by
+ * default; SELFRECAP_DRAFT overrides `enabled` (see draftGate).
+ */
+export interface DraftConfig {
+  enabled: boolean;
+  /** The reader's model: one reader over the whole period. */
+  reader_model: string;
+  /** The readers' model with --split (several readers on smaller parts). */
+  split_reader_model: string;
+  /** The checker's model. */
+  check_model: string;
+  /** What the timeline and the briefs call the person the session works with. */
+  operator: string;
 }
 
 export interface ServerConfig {
@@ -85,6 +112,7 @@ export interface AppConfig {
   accounts: string[];
   nudge: NudgeConfig;
   usage: UsageConfig;
+  draft: DraftConfig;
   /** File the config was read from, or null when running on defaults. */
   config_path: string | null;
   /** Everything wrong with the file, one line each. Empty when clean. */
@@ -101,6 +129,19 @@ export const NUDGE_DEFAULTS: NudgeConfig = {
 
 export const DEFAULT_SENTINEL = "RECAP-CYCLE";
 
+export const USAGE_DEFAULTS: UsageConfig = { enabled: false, source: "documented" };
+
+export const DRAFT_DEFAULTS: DraftConfig = {
+  enabled: false,
+  reader_model: "opus",
+  split_reader_model: "sonnet",
+  check_model: "opus",
+  operator: "the operator",
+};
+
+/** The environment variable that overrides `draft.enabled`: 1/true/on/yes or 0/false/off/no. */
+export const DRAFT_ENV = "SELFRECAP_DRAFT";
+
 export const DEFAULTS: AppConfig = {
   server: { port: 9090, host: "127.0.0.1" },
   voices: {},
@@ -110,10 +151,31 @@ export const DEFAULTS: AppConfig = {
   backup_dir: "./backups",
   accounts: ["~/.claude"],
   nudge: NUDGE_DEFAULTS,
-  usage: { enabled: false },
+  usage: USAGE_DEFAULTS,
+  draft: DRAFT_DEFAULTS,
   config_path: null,
   problems: [],
 };
+
+/**
+ * Whether the draft and the check are on for this process: SELFRECAP_DRAFT
+ * when it is set to a value it understands (the environment wins), else
+ * config `draft.enabled`. A value it does not understand is ignored, and
+ * `note` says so.
+ */
+export function draftGate(
+  config: Pick<AppConfig, "draft">,
+  env: NodeJS.ProcessEnv = process.env,
+): { enabled: boolean; source: "config" | "env"; note: string | null } {
+  const raw = env[DRAFT_ENV];
+  if (raw !== undefined && raw.trim() !== "") {
+    const v = raw.trim().toLowerCase();
+    if (["1", "true", "on", "yes"].includes(v)) return { enabled: true, source: "env", note: null };
+    if (["0", "false", "off", "no"].includes(v)) return { enabled: false, source: "env", note: null };
+    return { enabled: config.draft.enabled, source: "config", note: `${DRAFT_ENV}=${raw} is not 1 or 0; draft.enabled from config.yaml is used` };
+  }
+  return { enabled: config.draft.enabled, source: "config", note: null };
+}
 
 /** Expand a leading `~` to the user's home directory. */
 export function expandHome(p: string): string {
@@ -146,6 +208,7 @@ const TOP_KEYS = new Set([
   "accounts",
   "nudge",
   "usage",
+  "draft",
 ]);
 
 const NudgeSchema = z
@@ -158,7 +221,17 @@ const NudgeSchema = z
   })
   .strict();
 
-const UsageSchema = z.object({ enabled: z.boolean().optional() }).strict();
+const UsageSchema = z.object({ enabled: z.boolean().optional(), source: z.enum(["documented", "undocumented"]).optional() }).strict();
+
+const DraftSchema = z
+  .object({
+    enabled: z.boolean().optional(),
+    reader_model: z.string().min(1).optional(),
+    split_reader_model: z.string().min(1).optional(),
+    check_model: z.string().min(1).optional(),
+    operator: z.string().min(1).max(60).optional(),
+  })
+  .strict();
 
 function parseNudge(raw: unknown, problems: string[]): NudgeConfig {
   if (raw === undefined || raw === null) return { ...NUDGE_DEFAULTS };
@@ -175,15 +248,29 @@ function parseNudge(raw: unknown, problems: string[]): NudgeConfig {
 }
 
 function parseUsage(raw: unknown, problems: string[]): UsageConfig {
-  if (raw === undefined || raw === null) return { enabled: false };
+  if (raw === undefined || raw === null) return { ...USAGE_DEFAULTS };
   const parsed = UsageSchema.safeParse(raw);
   if (!parsed.success) {
-    // Same rule as the nudger: a broken block never opts in to reading credentials.
+    // Same rule as the nudger: a broken block never opts in. And it never
+    // falls back to the source that reads credentials: only a block that
+    // parses can choose `undocumented`.
     const enabled = typeof raw === "object" && (raw as Record<string, unknown>).enabled === true;
-    problems.push(`usage: ${parsed.error.issues[0]?.message ?? "invalid"}; usage bars ${enabled ? "on" : "OFF"}`);
-    return { enabled };
+    problems.push(`usage: ${parsed.error.issues[0]?.message ?? "invalid"}; usage bars ${enabled ? "on, source documented" : "OFF"}`);
+    return { enabled, source: "documented" };
   }
-  return { enabled: parsed.data.enabled ?? false };
+  return { enabled: parsed.data.enabled ?? false, source: parsed.data.source ?? USAGE_DEFAULTS.source };
+}
+
+function parseDraft(raw: unknown, problems: string[]): DraftConfig {
+  if (raw === undefined || raw === null) return { ...DRAFT_DEFAULTS };
+  const parsed = DraftSchema.safeParse(raw);
+  if (!parsed.success) {
+    // A broken block never switches on runs that cost money.
+    const issue = parsed.error.issues[0];
+    problems.push(`draft: ${issue ? `${issue.path.join(".") || "entry"} ${issue.message}` : "invalid"}; defaults used, draft and check OFF`);
+    return { ...DRAFT_DEFAULTS, enabled: false };
+  }
+  return { ...DRAFT_DEFAULTS, ...parsed.data };
 }
 
 function parseVoices(raw: unknown, problems: string[]): Record<string, VoiceConfig> {
@@ -268,6 +355,7 @@ export function loadConfig(configPath = process.env.RECAP_CONFIG || path.resolve
     accounts: accounts ?? DEFAULTS.accounts,
     nudge: parseNudge(parsed.nudge, problems),
     usage: parseUsage(parsed.usage, problems),
+    draft: parseDraft(parsed.draft, problems),
     config_path: configPath,
     problems,
   };

@@ -57,6 +57,22 @@ describe("routes", () => {
     expect(missing.statusCode).toBe(404);
   });
 
+  it("/voices/:voice/recap-plan: no draft unless asked for; ?draft=1 sizes it up to ?cut=; a bad cut is a 400", async () => {
+    const { app, a1, recaps } = setup({ recaps: ["alice-recap-001"] });
+    const plain = (await app.inject({ method: "GET", url: "/voices/alice/recap-plan", headers: HOST })).json();
+    expect(plain.draft).toBeNull();
+    expect(plain.headroom.draft_tokens).toBe(0);
+    expect(plain.self_restart).toMatchObject({ available: expect.any(Boolean), reason: expect.any(String) });
+    const now = (await app.inject({ method: "GET", url: "/voices/alice/recap-plan?draft=1", headers: HOST })).json();
+    expect(now.draft).toMatchObject({ exists: false, estimated: true, up_to: "now" });
+    expect(now.draft.path).toBe(path.join(recaps, "drafts", "draft-for-alice-recap-002.md").replace(/\\/g, "/"));
+    const upTo = (await app.inject({ method: "GET", url: `/voices/alice/recap-plan?draft=1&cut=${a1.uuid}`, headers: HOST })).json();
+    expect(upTo.draft.up_to).toBe("pending_cut");
+    expect(upTo.draft.timeline_chars).toBeLessThan(now.draft.timeline_chars);
+    const bad = await app.inject({ method: "GET", url: "/voices/alice/recap-plan?draft=1&cut=..%2Fx", headers: HOST });
+    expect(bad.statusCode).toBe(400);
+  });
+
   it("/voices/:voice/records reads around a line and hides the file path unless expose_paths", async () => {
     const hidden = setup();
     const r1 = (await hidden.app.inject({ method: "GET", url: "/voices/alice/records?around=2&span=1", headers: HOST })).json();

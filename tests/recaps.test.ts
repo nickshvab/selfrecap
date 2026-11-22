@@ -69,7 +69,7 @@ describe("parseSentinel", () => {
 
 describe("decodeBodyText", () => {
   it("handles a UTF-8 BOM and UTF-16 bodies (PowerShell 5.1 redirection)", () => {
-    const text = `Hey. Ärger – ок {"sentinel":"${S}","id":"x-recap-001"}`;
+    const text = `Hey. caf\u00e9 \u2013 \u20ac5 {"sentinel":"${S}","id":"x-recap-001"}`;
     expect(decodeBodyText(Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(text, "utf8")]))).toBe(text);
     expect(decodeBodyText(Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(text, "utf16le")]))).toBe(text);
     const be = Buffer.from(text, "utf16le");
@@ -136,7 +136,7 @@ describe("the recap stack", () => {
     expect(nextRecapNumber(stack).number).toBe(3);
   });
 
-  it("every recap at the head counts, whoever signed it: none may be cut", () => {
+  it("every recap at the head counts, whatever its voice or id: none may be cut", () => {
     const s = new Session();
     s.recap("alice", "alice-recap-001");
     s.recap("bob", "bob-recap-004");

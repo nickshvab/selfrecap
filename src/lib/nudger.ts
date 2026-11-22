@@ -1,10 +1,8 @@
 /**
  * The context nudge. WINDOWS ONLY, off by default (`nudge.enabled`).
  *
- * A colour on a dashboard is not an alert: it works only while someone
- * looks. This one has an addressee and an action. When a live session passes
- * `nudge.at` percent, it gets a message: find a seam, run /remember, then
- * restart.
+ * When a live session passes `nudge.at` percent, it gets a message: find a
+ * seam, run /remember, then restart.
  *
  * Only a session can call SendMessage, so the message travels by courier: a
  * one-shot `claude -p` on a cheap model (`nudge.model`), in the session's own
@@ -27,8 +25,8 @@
  *   overdue   a recap is applied but the old process is still running long
  *             after, or its restart failed: restart now, do not recap again
  *   ceiling   past 95% (or no room for a body): do NOT recap; stop and wait for
- *             the operator. Sent once per crossing, then silence: every nudge
- *             wakes the session and costs it a turn it cannot spare.
+ *             the operator. Sent once per crossing: each nudge costs the
+ *             session a turn.
  *
  * Who is not nudged:
  *  - a voice that is not live (no registry row with a live pipe), or answers twice;
@@ -69,7 +67,7 @@ export function nudgeText(percent: number, at: number, cooldownMinutes: number):
     `${FROM} you are at ${percent.toFixed(1)}% of your context window (the nudge line is ${at}%).`,
     `At the next clean seam in your work: pause, run /remember, and when --go has succeeded restart as its last step says`,
     `(\`selfrecap restart\` if your plan has a restart command, otherwise the operator restarts you), then report and end your turn.`,
-    `If you are already on it, ignore this. I look again in ${cooldownMinutes} min.`,
+    `If you are already on it, ignore this. Next check in ${cooldownMinutes} min.`,
   ].join(" ");
 }
 
@@ -229,7 +227,7 @@ export function deliver(config: AppConfig, name: string, account: string, text: 
     config.nudge.model,
     "--allowedTools",
     "SendMessage",
-    // Off Remote Control: a mirrored one-shot lingers in the cloud peer list.
+    // Remote Control off: a mirrored one-shot run would stay in the remote session list.
     "--settings",
     JSON.stringify({ remoteControlAtStartup: false, disableRemoteControl: true }),
   ];

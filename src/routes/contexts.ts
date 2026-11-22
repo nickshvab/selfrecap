@@ -8,7 +8,7 @@
  * doesn't break the response for the others.
  *
  * With `usage.enabled`, also `account_usage`: the plan-usage bars per Claude
- * account (see src/lib/account-usage.ts).
+ * account, from `usage.source` (see src/lib/account-usage.ts).
  */
 
 import path from "path";
@@ -134,7 +134,7 @@ export function registerContexts(app: FastifyInstance, config: AppConfig) {
       snapshot_at,
       voice_count: results.length,
       ...(config.usage.enabled
-        ? { account_usage: await accountUsage(usageAccounts, { warn: (m) => app.log.warn(m) }) }
+        ? { account_usage: await accountUsage(usageAccounts, { warn: (m) => app.log.warn(m) }, config.usage.source) }
         : {}),
       voices: Object.fromEntries(results),
     };

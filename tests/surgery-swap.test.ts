@@ -203,7 +203,7 @@ describe("surgery: cut, chain, stack", () => {
     expect(forced.ok, forced.reason).toBe(true);
   });
 
-  it("any recap pasted into the conversation is protected, whoever signed it", () => {
+  it("any recap pasted into the conversation is protected, whatever its voice or id", () => {
     const dir = tmpDir();
     const s = new Session();
     s.user("start");
@@ -378,7 +378,7 @@ describe("surgery: cut, chain, stack", () => {
       recap_content: recapText("bob", "bob-recap-007", "33333333-3333-4333-8333-333333333333"),
       dry_run: true,
     });
-    expect(otherVoice.reason!).toMatch(/^sentinel_voice_mismatch: this body is signed "bob"/);
+    expect(otherVoice.reason!).toMatch(/^sentinel_voice_mismatch: this body's sentinel names voice "bob"/);
   });
 
   it("other refusals: sentinel cut mismatch, missing file, and a backup that cannot be written", () => {

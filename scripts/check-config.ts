@@ -13,7 +13,7 @@
  */
 
 import fs from "fs";
-import { checkRestart, isFatalProblem, loadConfig } from "../src/config.js";
+import { DRAFT_ENV, checkRestart, draftGate, isFatalProblem, loadConfig } from "../src/config.js";
 import { buildRecapPlan } from "../src/lib/recap-plan.js";
 
 const arg = process.argv[2];
@@ -40,7 +40,20 @@ console.log(`Sentinel: ${config.sentinel_name}`);
 console.log(
   `Nudger: ${config.nudge.enabled ? `on at ${config.nudge.at}%${process.platform === "win32" ? "" : " (but it is Windows-only: it will not start here)"}` : "off"}`,
 );
-console.log(`Usage bars: ${config.usage.enabled ? "on (reads each account's login token)" : "off"}`);
+console.log(
+  `Usage bars: ${
+    !config.usage.enabled
+      ? "off"
+      : config.usage.source === "undocumented"
+        ? "on, source undocumented (reads each account's login token and calls Claude Code's own usage endpoint)"
+        : "on, source documented (reads what scripts/usage-statusline.mjs saved from the status line)"
+  }`,
+);
+const gate = draftGate(config);
+console.log(
+  `Draft and check: ${gate.enabled ? `on (${gate.source === "env" ? `${DRAFT_ENV} in this environment` : "draft.enabled"}): reader ${config.draft.reader_model}, --split ${config.draft.split_reader_model}, checker ${config.draft.check_model}` : `off${gate.source === "env" ? ` (${DRAFT_ENV} in this environment)` : ""}`}`,
+);
+if (gate.note) console.log(`  warn   ${gate.note}`);
 
 for (const [name, entry] of Object.entries(config.voices)) {
   const plan = buildRecapPlan(config, name);

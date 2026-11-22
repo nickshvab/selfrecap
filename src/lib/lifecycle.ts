@@ -5,8 +5,7 @@
  * kill through taskkill.
  *
  * Nothing here takes a target from outside: `selfrecap restart` works out
- * which session called it and acts on that session only. A session restarts
- * itself; nothing restarts someone else's.
+ * which session called it. It acts only on the session that called it.
  */
 
 import { spawnSync } from "child_process";
@@ -14,23 +13,19 @@ import { displayNameOf, type AppConfig, type VoiceConfig } from "../config.js";
 import { accountOfSessionFile, sameAccount, type LiveSession } from "./sessions.js";
 
 /**
- * The first thing a resumed session reads. Without a prompt a resumed session
- * waits for a human, and at 3 a.m. there is none. ASCII only, no quotes and no
- * cmd metacharacters: a launcher .cmd on the way parses the arguments a
- * second time.
+ * The resume prompt: the first prompt a resumed session gets. Without a
+ * prompt, a resumed session waits for input that may never come. ASCII only,
+ * no quotes and no cmd metacharacters: a launcher .cmd on the way parses the
+ * arguments a second time. The time is UTC, like every time selfrecap prints.
  */
-export function welcomeText(recapId: string | null, when: Date = new Date()): string {
-  const hhmm = when.toTimeString().slice(0, 5);
+export function resumePrompt(recapId: string | null, when: Date = new Date()): string {
+  const hhmm = `${when.toISOString().slice(11, 16)} UTC`;
   // The id comes from a sentinel the session wrote: keep only what cannot break the quoting.
   recapId = recapId ? recapId.replace(/[^A-Za-z0-9_-]/g, "") || null : null;
   if (recapId) {
-    return (
-      `Welcome back. You restarted yourself at ${hhmm} with selfrecap restart, after ${recapId}. ` +
-      `External signals say you are post-resume: that recap now stands where the period it covers used to be. ` +
-      `Carry on from where you left off.`
-    );
+    return `selfrecap restart resumed this session at ${hhmm} after ${recapId}, which now replaces the period it covers. Continue the work.`;
   }
-  return `Welcome back. You restarted yourself at ${hhmm} with selfrecap restart; no recap was applied, so your context is as it was. Carry on from where you left off.`;
+  return `selfrecap restart resumed this session at ${hhmm}; no recap was applied, so the context is unchanged. Continue the work.`;
 }
 
 /** A configured voice, as the live registry sees it. */

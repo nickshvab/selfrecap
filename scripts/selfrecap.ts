@@ -25,31 +25,21 @@
  *
  * A session is only ever resumed by its id: never by name, never with
  * --continue (either can open another session or fork this one).
+ *
+ * The scheduling side (who is calling, the checks, the lock, launching the
+ * helper) is src/lib/restart.ts, shared with `recap.ts <voice> --go
+ * --restart`; the helper's side (`_run`) is here.
  */
 
 import { spawn } from "child_process";
-import crypto from "crypto";
 import fs from "fs";
-import os from "os";
 import path from "path";
 import readline from "readline";
 import { fileURLToPath } from "url";
-import { DEFAULTS, checkRestart, loadConfig, restartCommandFor, type AppConfig } from "../src/config.js";
-import { resolveLiveSession } from "../src/lib/continuation.js";
-import { buildRecapPlan } from "../src/lib/recap-plan.js";
+import { DEFAULTS, loadConfig, type AppConfig } from "../src/config.js";
 import { LOG_DIR, recordLifecycle, tailLifecycleLog } from "../src/lib/lifecycle-log.js";
-import {
-  isAncestor,
-  killTree,
-  launchDetached,
-  powershellParseError,
-  processParents,
-  sleep,
-  voiceOfSession,
-  voiceRefs,
-  waitFor,
-  welcomeText,
-} from "../src/lib/lifecycle.js";
+import { killTree, resumePrompt, sleep, voiceRefs, waitFor } from "../src/lib/lifecycle.js";
+import { RUN_DIR, RestartError, WINDOWS_ONLY, callerSession, lockHeld, releaseLock, scheduleSelfRestart, type RestartJob } from "../src/lib/restart.js";
 import {
   claudeEnv,
   knownAccounts,
@@ -57,7 +47,6 @@ import {
   liveBySessionId,
   pidExists,
   pipeExists,
-  pipeKey,
   readRegistry,
   removeDeadRow,
   type LiveSession,
@@ -65,11 +54,10 @@ import {
 
 const REPO = fileURLToPath(new URL("../", import.meta.url));
 const SELF = fileURLToPath(import.meta.url);
-const TSX_LOADER = new URL("../node_modules/tsx/dist/loader.mjs", import.meta.url).href;
 
 /** How long a restart waits for the session's turn to end before giving up without killing. */
 const IDLE_TIMEOUT_MS = 20 * 60_000;
-/** The registry must say idle this long before the kill: a message landing right after a turn wakes it again. */
+/** The registry must say idle this long before the kill: a message landing right after a turn starts another. */
 const IDLE_STABLE_MS = 3_000;
 /** How long a resumed session has to appear in the registry. */
 const APPEAR_TIMEOUT_MS = 90_000;
@@ -77,8 +65,6 @@ const APPEAR_TIMEOUT_MS = 90_000;
 const STUCK_MS = 60_000;
 /** How long after a resume counts as success the helper keeps watching for a late dialog or a crash. */
 const AFTER_RESUME_WATCH_MS = 3 * 60_000;
-/** A restart lock older than this is a dead helper's: taken over. Idle wait + resume check + slack. */
-const LOCK_STALE_MS = 30 * 60_000;
 
 const [cmd, ...rest] = process.argv.slice(2);
 
@@ -98,58 +84,6 @@ try {
 }
 const accounts = knownAccounts(config.accounts, voiceRefs(config).flatMap((v) => (v.account ? [v.account] : [])));
 
-// ─── one restart per name at a time ────────────────────────────────────────
-
-/**
- * A lock per name, held from the moment a restart is launched until its
- * session is registered again (or the restart gave up). Without it a doubled
- * `selfrecap restart` would see the name free twice and start two copies: two
- * sessions on one name, and neither is reachable by it.
- */
-function lockFile(name: string): string {
-  return path.join(LOG_DIR, "run", `lock-${name.toLowerCase()}.json`);
-}
-
-function acquireLock(name: string): boolean {
-  const file = lockFile(name);
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  const body = JSON.stringify({ what: "restart", at: new Date().toISOString(), pid: process.pid, nonce: crypto.randomUUID() });
-  try {
-    fs.writeFileSync(file, body, { flag: "wx" });
-    return true;
-  } catch {
-    try {
-      const held = JSON.parse(fs.readFileSync(file, "utf8"));
-      if (Date.now() - Date.parse(held.at) < LOCK_STALE_MS) return false;
-    } catch {
-      // unreadable: treat as stale
-    }
-    // Take over a stale lock by replacing it whole, then check it is ours: of
-    // two takers at once, only the one whose body is there holds it.
-    const tmp = `${file}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, body);
-    fs.renameSync(tmp, file);
-    try {
-      return fs.readFileSync(file, "utf8") === body;
-    } catch {
-      return false;
-    }
-  }
-}
-
-function releaseLock(name: string): void {
-  fs.rmSync(lockFile(name), { force: true });
-}
-
-function lockHeld(name: string): boolean {
-  try {
-    const held = JSON.parse(fs.readFileSync(lockFile(name), "utf8"));
-    return Date.now() - Date.parse(held.at) < LOCK_STALE_MS;
-  } catch {
-    return false;
-  }
-}
-
 function short(account: string): string {
   return path.basename(account);
 }
@@ -159,89 +93,6 @@ function usage(code = 1): never {
   process.exit(code);
 }
 
-// ─── who is calling ────────────────────────────────────────────────────────
-
-/**
- * The Claude Code session this process runs inside; null for a human terminal.
- *
- * Claude Code gives every tool process its session's pid, id and messaging
- * pipe (CLAUDE_PID, CLAUDE_CODE_SESSION_ID, CLAUDE_CODE_MESSAGING_SOCKET).
- * All three must match one live registry row. And when the process tree can
- * answer (from Git Bash it usually cannot: see isAncestor), that pid must be
- * above us. This stops mistakes: a stale variable, a copied command, a script
- * run from the wrong shell. It is not a lock against a session that forges
- * another's environment on purpose.
- *
- * A subagent inside a session inherits the session's environment, so it counts
- * as the session: `selfrecap restart` from a session's own helper agent
- * restarts that session. That is the session's own act (it launched the helper).
- */
-function callerSession(): LiveSession | null {
-  if (!process.env.CLAUDECODE) return null;
-  const pid = Number(process.env.CLAUDE_PID);
-  const sessionId = process.env.CLAUDE_CODE_SESSION_ID;
-  const pipe = process.env.CLAUDE_CODE_MESSAGING_SOCKET;
-  if (!pid || !sessionId || !pipe) {
-    fail(
-      "selfrecap: inside Claude Code, but CLAUDE_PID / CLAUDE_CODE_SESSION_ID / CLAUDE_CODE_MESSAGING_SOCKET is missing: " +
-        "cannot tell which session is calling (Claude Code without cross-session messaging?).",
-    );
-  }
-  const account = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), ".claude");
-  const row = readRegistry(account).find((r) => r.pid === pid && r.sessionId === sessionId && r.alive);
-  if (!row) fail(`selfrecap: no live registry row for this session (pid ${pid}, ${sessionId}) in ${account}${path.sep}sessions.`);
-  if (!row.pipe || pipeKey(row.pipe) !== pipeKey(pipe)) {
-    fail(`selfrecap: this session's messaging pipe does not match its registry row. The environment does not describe the session running selfrecap; refusing.`);
-  }
-  if (isAncestor(pid, process.pid, processParents()) === "no") {
-    fail(`selfrecap: pid ${pid} is not above this process in the process tree. The environment does not describe the session running selfrecap; refusing.`);
-  }
-  return row;
-}
-
-// ─── the spec a detached run executes ──────────────────────────────────────
-
-interface RestartJob {
-  kind: "restart";
-  voice: string;
-  name: string;
-  account: string;
-  pid: number;
-  session_id: string;
-  command: string;
-  recap_id: string | null;
-}
-
-const RUN_DIR = () => path.join(LOG_DIR, "run");
-
-/**
- * Run a spec in its own process outside the caller's tree, in a new console.
- * On a launch failure the lock is released and the failure recorded, and
- * this exits.
- */
-function runDetached(spec: RestartJob): number {
-  fs.mkdirSync(RUN_DIR(), { recursive: true });
-  const file = path.join(RUN_DIR(), `${spec.kind}-${crypto.randomUUID()}.json`);
-  fs.writeFileSync(file, JSON.stringify(spec));
-  let commandLine = `"${process.execPath}" --import ${TSX_LOADER} "${SELF}" _run "${file}"`;
-  // The helper starts with the user's own environment, not ours: a log folder
-  // chosen with RECAP_LOG_DIR has to be handed over, or the helper would look
-  // for this spec (and the lock) in the default one.
-  if (process.env.RECAP_LOG_DIR) {
-    const q = (s: string) => `'${s.replace(/'/g, "''")}'`;
-    commandLine =
-      `powershell.exe -NoProfile -Command "$env:RECAP_LOG_DIR=${q(process.env.RECAP_LOG_DIR)}; ` +
-      `& ${q(process.execPath)} --import ${q(TSX_LOADER)} ${q(SELF)} _run ${q(file)}"`;
-  }
-  try {
-    return launchDetached(commandLine, REPO);
-  } catch (e: any) {
-    fs.rmSync(file, { force: true });
-    releaseLock(spec.name);
-    recordLifecycle(spec.voice, "aborted", `restart: the helper could not be started: ${e?.message ?? e}`, spec.session_id);
-    fail(`selfrecap: could not start the restart helper: ${e?.message ?? e}\n  Nothing was done. Recorded in selfrecap log.`);
-  }
-}
 
 // ─── waiting on the registry ───────────────────────────────────────────────
 
@@ -363,8 +214,8 @@ async function resumeOnce(spec: RestartJob): Promise<{
   done: Promise<void>;
   exited: () => boolean;
 }> {
-  // A PowerShell literal: the welcome text has no single quotes.
-  const child = spawn("powershell", ["-NoProfile", "-Command", `${spec.command} '${welcomeText(spec.recap_id)}'`], {
+  // A PowerShell literal: the resume prompt has no single quotes.
+  const child = spawn("powershell", ["-NoProfile", "-Command", `${spec.command} '${resumePrompt(spec.recap_id)}'`], {
     stdio: "inherit",
     env: claudeEnv(spec.account),
     windowsHide: false,
@@ -489,76 +340,21 @@ async function run(specFile: string): Promise<void> {
 
 function cmdRestart(target: string | undefined): void {
   if (process.platform !== "win32") {
-    fail(
-      "selfrecap restart is Windows-only (it checks liveness through Claude Code's Windows named pipes and starts the new console through WMI).\n" +
-        "  Restart by hand: close this session, then run the command `recap.ts --go` printed.",
-    );
+    fail(`${WINDOWS_ONLY}\n  Restart by hand: close this session, then run the command \`recap.ts --go\` printed.`);
   }
-  const caller = callerSession();
-  if (!caller) {
-    fail("selfrecap: restart is run by a session from inside itself (its Bash tool). From a terminal: close the session's window, then run its restart command.");
-  }
-  if (target && caller.name?.toLowerCase() !== target.toLowerCase()) {
-    fail(`selfrecap: restart acts only on the session that runs it. ${target} restarts itself, or its operator restarts it.`, 3);
-  }
-  const name = caller.name ?? "(unnamed)";
-  const voice = voiceOfSession(config, caller);
-  if (!voice) {
-    fail(
-      `selfrecap: ${name} on ${short(caller.account)} is not a voice in config.yaml (by its --name and account), so there is nothing to resume it into.\n` +
-        `  Put this line in your report; the operator restarts you by hand.`,
-    );
-  }
-  const check = checkRestart(voice.entry.session, voice.entry.restart);
-  if (check.errors.length > 0) {
-    fail(`selfrecap: ${voice.name}'s restart template is not safe to run:\n  ${check.errors.join("\n  ")}\n  Put this in your report; the operator restarts you by hand.`);
-  }
-  // Nothing is closed unless the command that resumes the session parses.
-  const parse = powershellParseError(restartCommandFor(voice.entry, caller.sessionId)!);
-  if (parse) {
-    fail(`selfrecap: ${voice.name}'s restart command does not parse in PowerShell (${parse}).\n  Put this in your report; the operator restarts you by hand.`);
-  }
-
-  // Resume the id that is actually running. If config.yaml leads somewhere
-  // else, that is drift: say it loudly, but do not resume a guess.
-  const resolved = resolveLiveSession(voice.entry.session);
-  const configId = path.basename(resolved.resolved_path, ".jsonl");
-  const drift = configId !== caller.sessionId;
-  if (drift) {
-    const detail = `running ${caller.sessionId}, but config.yaml leads to ${configId}: update the voice's session`;
-    recordLifecycle(voice.key, "id_drift", detail, caller.sessionId);
-    console.log(`selfrecap: WARNING ${detail}. Resuming the running id.`);
-  }
-  const command = restartCommandFor(voice.entry, caller.sessionId)!;
-  // Name the recap in the welcome only if one really landed in THIS session
-  // since this process started. Under drift the plan reads another file.
-  let recapId: string | null = null;
-  if (!drift) {
-    try {
-      const last = buildRecapPlan(config, voice.key).stack.at(-1);
-      if (last?.id && last.applied_at && caller.startedAt && Date.parse(last.applied_at) > caller.startedAt) recapId = last.id;
-    } catch {
-      // No plan: the welcome simply does not name a recap.
+  try {
+    const caller = callerSession();
+    if (!caller) {
+      fail("selfrecap: restart is run by a session from inside itself (its Bash tool). From a terminal: close the session's window, then run its restart command.");
     }
+    if (target && caller.name?.toLowerCase() !== target.toLowerCase()) {
+      fail(`selfrecap: restart acts only on the session that runs it. ${target} restarts itself, or its operator restarts it.`, 3);
+    }
+    scheduleSelfRestart(config, caller, (line) => console.log(line));
+  } catch (e) {
+    if (e instanceof RestartError) fail(e.message, e.code);
+    throw e;
   }
-  if (!acquireLock(voice.name)) {
-    fail(`selfrecap: a restart is already pending for ${voice.name}. Nothing new scheduled: send your report and end your turn.`, 6);
-  }
-  const pid = runDetached({
-    kind: "restart",
-    voice: voice.key,
-    name: voice.name,
-    account: caller.account,
-    pid: caller.pid,
-    session_id: caller.sessionId,
-    command,
-    recap_id: recapId,
-  });
-  recordLifecycle(voice.key, "restart_scheduled", `helper pid ${pid}`, caller.sessionId);
-  console.log(`selfrecap: restart scheduled for ${voice.name} (helper pid ${pid}, in its own console).`);
-  console.log(`  Send your report, then end your turn. When you go idle this session closes and resumes by id`);
-  console.log(`  ${caller.sessionId} in that console, with a welcome-back prompt. Nothing after the report: every`);
-  console.log(`  further turn here costs context in the old session.`);
 }
 
 function cmdLog(n: string | undefined): void {

@@ -9,8 +9,9 @@
  * The repo copy is the source of truth. Installed copies are never edited by
  * hand; change skills/remember/SKILL.md, then run this.
  *
- * The skill drives the server (`recap.ts --plan` needs 1.1.0), so this refuses
- * to install while the running server is older: update and restart it first.
+ * The skill drives the server (its flow needs the 1.2.0 plan: the pending
+ * cut, the self-restart line, the draft), so this refuses to install while
+ * the running server is older: update and restart it first.
  *
  *   npm run install-skill                 (or: npx tsx scripts/install-skill.ts [--dry-run])
  */
@@ -22,7 +23,7 @@ import { fileURLToPath } from "url";
 import { loadConfig } from "../src/config.js";
 import { accountOfSessionFile, knownAccounts } from "../src/lib/sessions.js";
 
-const REQUIRED_SERVER = "1.1.0";
+const REQUIRED_SERVER = "1.2.0";
 
 // `npm run install-skill --dry-run` hands the flag to npm, not to us: honour npm's copy too.
 const dryRun = process.argv.includes("--dry-run") || process.env.npm_config_dry_run === "true";

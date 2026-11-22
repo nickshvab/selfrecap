@@ -1,7 +1,7 @@
 /**
  * selfrecap — HTTP API for Claude Code session continuity.
  *
- * Endpoints (full reference: README.md):
+ * Endpoints (full reference: docs/api.md):
  *   GET  /health                      — liveness, version, config problem count
  *   GET  /voices                      — configured voices, their files, config problems
  *   GET  /voices/:voice/recap-plan    — everything a session needs for /remember

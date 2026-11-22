@@ -10,7 +10,7 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { NUDGE_DEFAULTS, displayNameOf, loadConfig } from "../src/config.js";
-import { isAncestor, voiceByName, voiceOfSession, welcomeText } from "../src/lib/lifecycle.js";
+import { isAncestor, resumePrompt, voiceByName, voiceOfSession } from "../src/lib/lifecycle.js";
 import { ceilingText, nudgeText, overdueText } from "../src/lib/nudger.js";
 import { parseUsage } from "../src/lib/account-usage.js";
 import {
@@ -154,16 +154,15 @@ describe("voices and live sessions", () => {
 });
 
 describe("texts", () => {
-  it("the welcome names a recap only when one landed, and survives a launcher's second parse", () => {
-    const when = new Date(2026, 0, 23, 3, 7);
-    const withRecap = welcomeText("alice-recap-002", when);
-    expect(withRecap).toMatch(/03:07/);
-    expect(withRecap).toMatch(/after alice-recap-002/);
-    expect(withRecap).toMatch(/selfrecap restart/);
-    expect(welcomeText(null, when)).toMatch(/no recap was applied/);
+  it("the resume prompt names a recap only when one landed, and survives a launcher's second parse", () => {
+    // The time is UTC and says so, whatever the machine's zone.
+    const when = new Date(Date.UTC(2026, 0, 23, 14, 7));
+    const withRecap = resumePrompt("alice-recap-002", when);
+    expect(withRecap).toBe("selfrecap restart resumed this session at 14:07 UTC after alice-recap-002, which now replaces the period it covers. Continue the work.");
+    expect(resumePrompt(null, when)).toBe("selfrecap restart resumed this session at 14:07 UTC; no recap was applied, so the context is unchanged. Continue the work.");
     // The id comes from a sentinel: anything that could break the quoting is dropped.
-    expect(welcomeText(`x'; rm -rf /"`, when)).not.toMatch(/["';/]/);
-    for (const t of [withRecap, welcomeText(null, when)]) {
+    expect(resumePrompt(`x'; rm -rf /"`, when)).not.toMatch(/["';/]/);
+    for (const t of [withRecap, resumePrompt(null, when)]) {
       // cmd metacharacters and quotes would be re-parsed by a launcher .cmd; the PowerShell literal is single-quoted
       expect(t).not.toMatch(/["'%!^&|<>]/);
       expect(t).toMatch(/^[\x20-\x7e]+$/);
@@ -175,6 +174,7 @@ describe("texts", () => {
     expect(n).toMatch(/84\.3%/);
     expect(n).toMatch(/\/remember/);
     expect(n).toMatch(/selfrecap restart/);
+    expect(n).toMatch(/Next check in 10 min\.$/);
     expect(overdueText(90, "alice-recap-002", "recap applied 25 min ago")).toMatch(/Do not recap again/);
     expect(ceilingText(96)).toMatch(/Do not run \/remember/);
   });

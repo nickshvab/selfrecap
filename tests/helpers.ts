@@ -12,6 +12,7 @@ import os from "os";
 import path from "path";
 import crypto from "crypto";
 import { fileURLToPath } from "url";
+import { afterAll } from "vitest";
 import { loadJsonl, type JsonlRecord } from "../src/lib/jsonl.js";
 import { DEFAULTS, type AppConfig } from "../src/config.js";
 
@@ -92,15 +93,19 @@ export function toJsonl(records: JsonlRecord[]): string {
 // ─── Synthetic sessions ─────────────────────────────────────────────────────
 
 const created: string[] = [];
-process.on("exit", () => {
-  for (const dir of created) {
+function removeCreated(): void {
+  for (const dir of created.splice(0)) {
     try {
       fs.rmSync(dir, { recursive: true, force: true });
     } catch {
       // Best effort.
     }
   }
-});
+}
+// After each test file: vitest's worker processes are ended without an
+// `exit` event, so that alone left every temp folder behind.
+afterAll(removeCreated);
+process.on("exit", removeCreated);
 
 /** A temp folder (symlinks resolved), removed when the test process exits. */
 export function tmpDir(): string {
@@ -165,6 +170,23 @@ export class Session {
     return r;
   }
 
+  /**
+   * A record of Claude Code's request log: uuid-less, outside the chain. A
+   * blob holds a copy of a message as it was sent; Claude Code writes them
+   * again whenever a session is brought up from disk.
+   */
+  requestBlob(message: Rec): Rec {
+    return this.meta("api-request-blob", { hash: crypto.randomBytes(32).toString("hex"), message });
+  }
+
+  requestLog(): Rec {
+    return this.meta("api-request", { id: crypto.randomUUID(), timestamp: ts(), base: null, keep: 0, tail: [] });
+  }
+
+  requestShape(): Rec {
+    return this.meta("api-request-shape", { shapeHash: crypto.randomBytes(32).toString("hex"), timestamp: ts(), shape: { system: [], tools: [] } });
+  }
+
   recap(voice: string, id: string): Rec {
     const r: Rec = {
       ...this.base("user"),
@@ -217,6 +239,11 @@ export class Session {
 
   system(subtype: string): Rec {
     return this.chain({ ...this.base("system"), subtype, content: "" });
+  }
+
+  /** Any chained record: the usual fields, then `extra` (attachments, meta user records, odd content). */
+  chained(type: string, extra: Rec): Rec {
+    return this.chain({ ...this.base(type), ...extra });
   }
 
   /** A chained record that is not written to the file yet, for simulating appends. */

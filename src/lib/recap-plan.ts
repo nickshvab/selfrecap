@@ -1,5 +1,5 @@
 /**
- * Recap plan — everything a session at its context wall needs for /remember,
+ * Recap plan — everything a session near its context limit needs for /remember,
  * worked out from config and the live session so the session juggles no paths
  * and counts no files: where the session lives now, the recap stack, the next
  * recap number and body path, the sentinel values, and the restart command.
@@ -7,14 +7,21 @@
  * The next number comes from the session's recap stack, not from the folder:
  * the stack is what surgery keeps and what the voice has in context. The
  * folder is checked against it and disagreements come back as warnings.
+ *
+ * With the draft on (PlanOptions.draft), the plan also sizes the draft for
+ * the next recap: its real size once `recap.ts --draft` has written it, else
+ * an estimate; a written draft not yet read counts against the body budget.
+ * Without it, the plan is what it was before the draft existed.
  */
 
 import fs from "fs";
 import path from "path";
-import { displayNameOf, getVoice, isUnderAllowedRoots, recapsDirOf, restartCommandFor, type AppConfig } from "../config.js";
+import { checkRestart, displayNameOf, getVoice, isUnderAllowedRoots, recapsDirOf, restartCommandFor, type AppConfig, type VoiceConfig } from "../config.js";
 import { resolveLiveSession } from "./continuation.js";
-import { loadJsonl } from "./jsonl.js";
+import { DRAFT_SHARE_OF_TIMELINE, charsReadOf, draftFileFor, draftTokensFor, draftsDirFor, timelineChars } from "./draft.js";
+import { loadJsonl, type JsonlRecord } from "./jsonl.js";
 import { readContextSize } from "./monitor.js";
+import { locateCut, readPendingCut } from "./pending-cut.js";
 import { decodeBodyText, formatRecapId, nextRecapNumber, recapBodyFileName, scanRecapStack } from "./recaps.js";
 
 export interface RecapPlan {
@@ -46,9 +53,40 @@ export interface RecapPlan {
     ceiling_percent: number;
     tokens_to_ceiling: number;
     reserve_tokens: number;
+    /** What is still to read of a written draft: counted here, so TIGHT and NO ROOM already include it. 0 without the draft. */
+    draft_tokens: number;
     body_budget_chars: number;
     tight: boolean;
   } | null;
+  /**
+   * The draft for the next recap: its real size once `--draft` has written it,
+   * else an estimate from the timeline it would be made from. Null when the
+   * draft is off for this plan, or there is no session or recaps folder.
+   */
+  draft: {
+    /** In the voice's own recaps folder: <recaps>/drafts/draft-for-<id>.md. */
+    path: string;
+    exists: boolean;
+    /** Characters: the file's, or the estimate. */
+    chars: number;
+    /** About how many tokens reading all of it costs. */
+    tokens: number;
+    /** Written: what the session has not read yet (Read calls since it was written). Not written: all of it. */
+    unread_tokens: number;
+    estimated: boolean;
+    /** For the estimate: the timeline's length, from the end of the recap stack up to... */
+    timeline_chars: number | null;
+    /** ...the pending cut, or the end of the session when there is none. */
+    up_to: "pending_cut" | "now" | null;
+    /** The body budget left after reading all of it (the estimate only; a written draft is counted in headroom). */
+    body_budget_after_chars: number | null;
+  } | null;
+  /**
+   * Whether `recap.ts --go --restart` can restart this session itself
+   * (`selfrecap restart`), and why not when it cannot. Checked again, with
+   * the calling session, when it runs.
+   */
+  self_restart: { available: boolean; reason: string };
   /** The recap stack at the head of the live session, oldest first. */
   stack: Array<{
     line_idx: number;
@@ -67,8 +105,8 @@ export interface RecapPlan {
     body_exists: boolean;
     /**
      * Length of that body in characters — what the headroom budget counts.
-     * Not bytes: `wc -c` counts bytes, and Cyrillic takes two per character,
-     * so a body in a non-Latin script looks twice its size to it.
+     * Not bytes: `wc -c` counts bytes, and many non-Latin characters take two
+     * or more, so a body in a non-Latin script looks twice its size to it.
      */
     body_chars: number | null;
   };
@@ -91,17 +129,17 @@ const CEILING = 0.97;
  * from writing the body: the searches and seam reads, the dry run, --go and
  * the report, plus its own reasoning in between.
  *
- * In practice: a typical cycle's tool output is ~12k tokens and the /remember
- * text ~12k (usually not yet in the plan's reading). A cycle with an
- * easy seam (one search, one seam read, no backtracking) cost ~24k for the
- * whole protocol. So ~24k is the solid part and the other 16k is the variance
- * term for hard seams, where reasoning over several candidates is what grows.
+ * An estimate: the tool output of a cycle is around 12k tokens and the
+ * /remember text around 12k (usually not yet in the plan's reading), so a
+ * cycle with an easy seam (one search, one seam read, no backtracking) needs
+ * around 24k for the whole protocol. The other 16k is a margin for hard seams,
+ * where reasoning over several candidates is what grows.
  */
 export const RESERVE_TOKENS = 40_000;
-/** Characters per token for recap prose, counted low so the budget errs small (Cyrillic, for one, tokenizes densely). */
+/** Characters per token for recap prose, counted low so the budget errs small (non-Latin text often tokenizes densely). */
 const CHARS_PER_TOKEN = 2.5;
 /** Below this body budget the plan says TIGHT. */
-const TIGHT_CHARS = 40_000;
+export const TIGHT_CHARS = 40_000;
 
 function pad(n: number): string {
   return String(n).padStart(3, "0");
@@ -118,21 +156,107 @@ function slash(p: string | null): string | null {
   return p === null ? null : p.replace(/\\/g, "/");
 }
 
-/** Room left before the ceiling, and the body budget that leaves after the reserve. */
-export function headroomFor(tokensTotal: number): NonNullable<RecapPlan["headroom"]> {
+/** Room left before the ceiling, and the body budget that leaves after the reserve and the draft still to read. */
+export function headroomFor(tokensTotal: number, draftTokens = 0): NonNullable<RecapPlan["headroom"]> {
   const toCeiling = Math.max(0, Math.floor(WINDOW_TOKENS * CEILING) - tokensTotal);
-  const budget = Math.max(0, Math.floor((toCeiling - RESERVE_TOKENS) * CHARS_PER_TOKEN));
+  const budget = Math.max(0, Math.floor((toCeiling - RESERVE_TOKENS - draftTokens) * CHARS_PER_TOKEN));
   return {
     ceiling_percent: CEILING * 100,
     tokens_to_ceiling: toCeiling,
     reserve_tokens: RESERVE_TOKENS,
+    draft_tokens: draftTokens,
     body_budget_chars: budget,
     tight: budget < TIGHT_CHARS,
   };
 }
 
+/**
+ * Whether `selfrecap restart` can be scheduled for this voice, from config
+ * and platform alone. The calling session, the PowerShell parse of the
+ * command and the lock are checked when it runs.
+ */
+export function selfRestartFor(name: string, entry: VoiceConfig, platform: string = process.platform): RecapPlan["self_restart"] {
+  if (platform !== "win32") {
+    return { available: false, reason: "selfrecap restart is Windows-only: after --go the operator restarts the session with the restart command" };
+  }
+  if (!entry.restart) return { available: false, reason: `no restart command in config.yaml for ${name}: after --go the operator restarts the session by hand` };
+  const check = checkRestart(entry.session, entry.restart);
+  if (check.errors.length > 0) return { available: false, reason: `the restart command fails its checks (${check.errors[0]}): the operator restarts the session by hand` };
+  return { available: true, reason: "--go --restart runs the surgery, then schedules selfrecap restart for the session that runs it" };
+}
+
+export interface PlanOptions {
+  /**
+   * Size the draft and count a written one in headroom. Off unless asked
+   * for: it reads the whole period. The plan route asks when the draft is on
+   * (recap.ts says which, by its own config and SELFRECAP_DRAFT); the
+   * nudger, check-config and selfrecap restart never do, so their "no room"
+   * stays about the body alone.
+   */
+  draft?: boolean;
+  /**
+   * The pending cut the draft's estimate runs up to, as recap.ts holds it.
+   * Without it the pending-cut file in the log folder is read.
+   */
+  cut?: string;
+  /** Where pending cuts are kept (tests). */
+  logDir?: string;
+}
+
+/**
+ * The draft for the next recap, from what the plan already read. Lives here,
+ * beside the headroom it is counted in, so the plan route, `--plan` and the
+ * TIGHT line read one number.
+ */
+function draftInfo(
+  config: AppConfig,
+  records: ReadonlyArray<JsonlRecord>,
+  name: string,
+  display: string,
+  bodyPath: string,
+  nextId: string,
+  opts: PlanOptions,
+): NonNullable<RecapPlan["draft"]> {
+  const file = draftFileFor(draftsDirFor(bodyPath), nextId);
+  if (fs.existsSync(file)) {
+    const chars = fs.readFileSync(file, "utf8").length;
+    const tokens = draftTokensFor(chars);
+    const read = charsReadOf(records, file, fs.statSync(file).mtimeMs);
+    return {
+      path: slash(file),
+      exists: true,
+      chars,
+      tokens,
+      unread_tokens: draftTokensFor(Math.max(0, chars - read)),
+      estimated: false,
+      timeline_chars: null,
+      up_to: null,
+      body_budget_after_chars: null,
+    };
+  }
+  const sentinel = { sentinel: config.sentinel_name };
+  const from = scanRecapStack(records, config.sentinel_name).end;
+  const cut = opts.cut ?? readPendingCut(name, opts.logDir)?.cut_uuid ?? null;
+  const at = cut ? locateCut(records, cut, sentinel) : null;
+  const to = at?.ok ? at.idx : records.length - 1;
+  const timeline = timelineChars(records, from, to, { operator: config.draft.operator, voice: display }, sentinel);
+  const chars = Math.round(timeline.chars * DRAFT_SHARE_OF_TIMELINE);
+  const tokens = draftTokensFor(chars);
+  return {
+    path: slash(file),
+    exists: false,
+    chars,
+    tokens,
+    unread_tokens: tokens,
+    estimated: true,
+    timeline_chars: timeline.chars,
+    up_to: at?.ok ? "pending_cut" : "now",
+    body_budget_after_chars: null,
+  };
+}
+
 /** The recap plan for one voice (case-insensitive name). Throws UnknownVoiceError. */
-export function buildRecapPlan(config: AppConfig, voiceName: string, now = new Date()): RecapPlan {
+export function buildRecapPlan(config: AppConfig, voiceName: string, now = new Date(), opts: PlanOptions = {}): RecapPlan {
   const { name, entry } = getVoice(config, voiceName);
   const warnings: string[] = [];
 
@@ -189,10 +313,24 @@ export function buildRecapPlan(config: AppConfig, voiceName: string, now = new D
   }
   if (!entry.restart) warnings.push(`no restart command configured for ${name}: set restart in config.yaml so --go can print it`);
 
+  const display = displayNameOf(name, entry);
+  const nextId = formatRecapId(name, next.number);
+  let draft: RecapPlan["draft"] = null;
+  // No recaps folder, no draft: it lives only in the voice's own folder.
+  if (opts.draft === true && exists && bodyPath) {
+    try {
+      draft = draftInfo(config, records, name, display, bodyPath, nextId, opts);
+    } catch (e: any) {
+      warnings.push(`the draft's size could not be worked out: ${!config.expose_paths && typeof e?.path === "string" ? `${e.code ?? "error"} (${e.syscall ?? "fs"})` : (e?.message ?? e)}`);
+    }
+  }
+  const headroom = reading ? headroomFor(reading.tokens_total, draft?.exists ? draft.unread_tokens : 0) : null;
+  if (draft?.estimated && reading) draft.body_budget_after_chars = headroomFor(reading.tokens_total, draft.tokens).body_budget_chars;
+
   const show = (p: string) => (config.expose_paths ? slash(p) : path.basename(p));
   return {
     voice: name,
-    name: displayNameOf(name, entry),
+    name: display,
     sentinel_name: config.sentinel_name,
     home: slash(entry.home ?? null),
     recaps_dir: slash(recapsDir),
@@ -209,7 +347,9 @@ export function buildRecapPlan(config: AppConfig, voiceName: string, now = new D
     context: reading
       ? { tokens_total: reading.tokens_total, percent_of_1m: reading.percent_of_1m, last_usage_ts: reading.last_usage_ts }
       : null,
-    headroom: reading ? headroomFor(reading.tokens_total) : null,
+    headroom,
+    draft,
+    self_restart: selfRestartFor(name, entry),
     stack: stack.recaps.map((r) => ({
       line_idx: r.index,
       id: r.id,
@@ -219,7 +359,7 @@ export function buildRecapPlan(config: AppConfig, voiceName: string, now = new D
     })),
     next: {
       number: next.number,
-      id: formatRecapId(name, next.number),
+      id: nextId,
       predecessor_id: lastRecap?.id ?? null,
       body_path: slash(bodyPath),
       body_exists: bodyExists,
