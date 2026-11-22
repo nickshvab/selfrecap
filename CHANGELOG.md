@@ -263,5 +263,4 @@ self-authored recap surgery as an alternative to lossy auto-compaction.
   `docs/` set (`protocol.md`, `walkthrough.md`, `recap-writing-guide.md`,
   `cache-mechanics.md`).
 
-[1.1.0]: https://github.com/nickshvab/selfrecap/releases/tag/v1.1.0
-[1.0.0]: https://github.com/nickshvab/selfrecap/releases/tag/v1.0.0
+[1.2.0]: https://github.com/nickshvab/selfrecap/releases/tag/v1.2.0
