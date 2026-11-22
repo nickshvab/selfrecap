@@ -5,6 +5,21 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Memory on long sessions.** A context reading parsed the whole transcript to
+  find its last usage record: several hundred MB of heap for a moment on a
+  70 MB file, on every `/context` call, every recap plan and every nudger tick.
+  It now reads the file from its end in growing chunks and counts lines in a
+  streaming pass (about 6 MB instead of about 580 MB on a 71 MB transcript),
+  and answers an unchanged file from a cache keyed by path, size and mtime. The
+  reading is the same, field for field. Past 64 MB of tail without a usage
+  record it falls back to the whole-file reading and logs a line saying so.
+  `/contexts` still loads each voice's live file whole, because it also reads
+  the recap stack.
+
 ## [1.1.0] - 2026-10-15
 
 Field-tested improvements from the original deployment, ported in: surgery that
